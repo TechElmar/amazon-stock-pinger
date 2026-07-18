@@ -1,0 +1,14 @@
+# Drop one proxy per line. Supported formats:
+#
+#   http://user:pass@host:port
+#   host:port:user:pass
+#   host:port
+#   DIRECT          (uses your local IP — NOT recommended for Amazon)
+#
+# Lines starting with # are ignored. Blank lines are ignored.
+# Copy this file to "proxies.txt" and add your real proxies.
+
+# Examples (these are fake — replace with your own):
+# http://user:pass@1.2.3.4:8080
+# 5.6.7.8:8080:user:pass
+# 9.10.11.12:3128

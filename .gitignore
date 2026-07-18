@@ -1,0 +1,37 @@
+# Local state — DO NOT COMMIT
+amazon_monitor_pro.db
+amazon_monitor_pro.db-journal
+amazon_monitor_pro.db-wal
+amazon_monitor_pro.db-shm
+
+# Proxy credentials
+proxies.txt
+
+# Personal product list — your tracked ASINs
+watchlist.txt
+
+# Legacy Playwright browser profile (cookies, login data, cache)
+# Safe to delete entirely — no longer used by the stock-pinger build.
+amazon_profile/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log

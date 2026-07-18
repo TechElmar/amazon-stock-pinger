@@ -1,0 +1,14 @@
+# Amazon Stock Pinger — watchlist
+# Format: ASIN [ping_target]
+#   ASIN alone      → daily-digest only, never @everyone-pings
+#   ASIN 64.99      → @everyone ping when Amazon price ≤ $64.99
+# Lines starting with # are ignored. Edit while the bot is
+# stopped, then restart — the products table syncs to match
+# this file (additions, removals, target changes).
+#
+# Copy this file to "watchlist.txt" and add your real ASINs.
+
+# Examples:
+# B0DN98RVZM            # digest-only: shows in the daily stock list
+# B0G3CV6Z9D 65.00      # @everyone when Amazon price <= $65.00
+# B0G4XJPN8Q 121.00
