@@ -282,13 +282,23 @@ def load_proxies() -> List[Optional[str]]:
 
 def proxy_label_from_url(proxy: Optional[str]) -> str:
     """Short display label for a proxy URL. For provider-style URLs
-    where many proxies share the same host:port but differ by session
-    ID, extract the session token so each distinct session shows up
-    separately in stats."""
+    where many proxies share the same host:port but differ by a
+    session/residential ID embedded in the username (e.g. Webshare's
+    "user-session-1234" or "userresidential-19912"), extract that
+    trailing ID so each distinct proxy shows up separately in stats.
+
+    Without this, a rotating-residential list where every entry shares
+    one gateway host:port (but has thousands of unique IDs) would
+    collapse into a SINGLE label — meaning a cooldown triggered by a
+    handful of bad IPs would incorrectly blacklist the entire pool.
+    The ID is matched positionally (last hyphen-segment of the
+    username, right before the password) rather than requiring the
+    literal word "session", so it works across naming conventions.
+    """
     if not proxy:
         return "direct"
     label = proxy.split("@")[-1]
-    m = re.search(r"session-([A-Za-z0-9]+)", proxy)
+    m = re.search(r"-([A-Za-z0-9]+)(?=:[^@]*@)", proxy)
     if m:
         label = f"{label}/{m.group(1)}"
     return label
