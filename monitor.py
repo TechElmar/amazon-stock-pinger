@@ -79,6 +79,16 @@ ROTATION_CHECK_INTERVAL = 15
 # params so different CloudFront edges return fresh stock state.
 WISHLIST_HTTP_STAGGER_SECONDS = 0.075
 
+# How long a wishlist item's last-seen data stays valid in the merged
+# view. Amazon renders wishlist items in chunks, so any single fetch
+# may return only a SUBSET of the list. Rather than replacing the
+# whole snapshot per fetch (which would momentarily drop the missing
+# items and force them back onto the heavily-WAF'd /dp/ path), we MERGE
+# each fetch into a rolling view and keep an item as long as it was
+# seen within this window. A genuinely-removed wishlist item ages out
+# after the TTL and then falls back to /dp/, which is correct.
+WISHLIST_MERGE_TTL_SECONDS = 90
+
 # ASYMMETRIC hysteresis. Flipping the confirmed stock state requires
 # this many CONSECUTIVE consistent observations. The two directions
 # use different thresholds ON PURPOSE:
@@ -908,6 +918,11 @@ class MonitorWorker(QThread):
         self.wishlist_scanner: Optional["WishlistScanner"] = None
         self.wishlist_results: Dict[str, Dict[str, Any]] = {}
         self.previous_wishlist_results: Dict[str, Dict[str, Any]] = {}
+        # Rolling merged wishlist view: asin -> (result, monotonic_ts).
+        # Each partial fetch updates the entries it saw; wishlist_results
+        # is rebuilt from everything seen within WISHLIST_MERGE_TTL_SECONDS
+        # so a chunked/partial fetch can't drop items back to /dp/.
+        self._wishlist_seen: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
         # Shared refs set in run_async.
         self.notifier: Optional["DiscordNotifier"] = None
@@ -1856,9 +1871,23 @@ class MonitorWorker(QThread):
                     prod, dict(dat), source=f"wishlist/{source}"
                 )
 
-        self.wishlist_results = results
-        self.previous_wishlist_results = {
-            k: dict(v) for k, v in results.items()
+        # MERGE this fetch into the rolling view instead of replacing.
+        # Amazon may return only a subset of the list per fetch; a plain
+        # assignment would momentarily drop the missing items and shove
+        # them back onto the WAF-blocked /dp/ path. Keep every item seen
+        # within WISHLIST_MERGE_TTL_SECONDS.
+        now_mono = time.monotonic()
+        for ai, dat in results.items():
+            self._wishlist_seen[ai] = (dict(dat), now_mono)
+        cutoff = now_mono - WISHLIST_MERGE_TTL_SECONDS
+        self._wishlist_seen = {
+            ai: (dat, ts)
+            for ai, (dat, ts) in self._wishlist_seen.items()
+            if ts >= cutoff
+        }
+        self.previous_wishlist_results = self.wishlist_results
+        self.wishlist_results = {
+            ai: dat for ai, (dat, ts) in self._wishlist_seen.items()
         }
 
     async def _fetch_wishlist_url(
