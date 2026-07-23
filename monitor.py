@@ -89,6 +89,43 @@ WISHLIST_HTTP_STAGGER_SECONDS = 0.075
 # after the TTL and then falls back to /dp/, which is correct.
 WISHLIST_MERGE_TTL_SECONDS = 90
 
+# Wishlist PAGINATION. Amazon server-renders only the first ~10 items of
+# a wishlist; the rest load via a "show more" endpoint
+# (/hz/wishlist/slv/items?...&paginationToken=<lek>). The scanner walks
+# that chain each cycle so ALL items are covered, not just the first
+# page. WISHLIST_MAX_PAGES caps the walk (the token wraps and re-serves
+# once exhausted, so we also stop as soon as a page adds no new ASINs).
+# Each page gets a few proxy retries before we give up on it for the
+# cycle — the merge+TTL keeps its last-known data alive meanwhile.
+WISHLIST_MAX_PAGES = 8
+WISHLIST_PAGE_RETRIES = 4
+# Target time for one full-list crawl cycle; real cycles run longer due
+# to per-page fetch latency (~1-3s for a 24-item / 3-page list), which
+# is plenty fast for restock detection and far lighter on the proxies
+# than the old 13-fetch/sec single-page firehose.
+WISHLIST_CYCLE_SECONDS = 0.5
+WISHLIST_CYCLE_MIN_SLEEP = 0.2
+
+# Extracts the "show more" pagination URL from a wishlist page/fragment.
+_SHOW_MORE_RE = re.compile(r'"showMoreUrl"\s*:\s*"([^"]+)"')
+
+
+def extract_show_more_url(html: str) -> str:
+    """Return the relative 'load more items' URL embedded in a wishlist
+    page, or '' if this is the last page. Handles JSON-escaped and
+    HTML-attribute-escaped forms."""
+    m = _SHOW_MORE_RE.search(html)
+    if not m:
+        m = re.search(r'id="showMoreUrl"[^>]*value="([^"]+)"', html)
+    if not m:
+        return ""
+    return (
+        m.group(1)
+        .replace("&amp;", "&")
+        .replace("\\u0026", "&")
+        .replace("\\/", "/")
+    )
+
 # ASYMMETRIC hysteresis. Flipping the confirmed stock state requires
 # this many CONSECUTIVE consistent observations. The two directions
 # use different thresholds ON PURPOSE:
@@ -923,6 +960,9 @@ class MonitorWorker(QThread):
         # is rebuilt from everything seen within WISHLIST_MERGE_TTL_SECONDS
         # so a chunked/partial fetch can't drop items back to /dp/.
         self._wishlist_seen: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        # Diagnostics for the paginated crawler (last completed cycle).
+        self._last_crawl_pages: int = 0
+        self._last_crawl_items: int = 0
 
         # Shared refs set in run_async.
         self.notifier: Optional["DiscordNotifier"] = None
@@ -1894,26 +1934,40 @@ class MonitorWorker(QThread):
         self,
         url: str,
         proxy: Optional[str],
-    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
-        """Low-level wishlist GET to an arbitrary URL (so we can pass
-        a cache-busted variant). Returns (results_dict, status_message).
+    ) -> Tuple[Dict[str, Dict[str, Any]], str, str]:
+        """Low-level wishlist GET to an arbitrary URL (so we can pass a
+        cache-busted variant and the paginated 'show more' URLs).
+        Returns (results_dict, status_message, next_page_url). The last
+        value is the relative 'load more' URL for the next page, or ''
+        if this is the final page.
         """
         if self.scan_session is None or self.wishlist_scanner is None:
-            return {}, "no session"
+            return {}, "no session", ""
 
+        # The paginated /slv/items fragments are an XHR endpoint; the
+        # main list page is a normal navigation. Send the headers each
+        # one expects.
+        is_more = "/slv/items" in url
         headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept": (
+                "text/html,*/*;q=0.9" if is_more else
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
             "Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
-            "Referer": f"{self.wishlist_scanner.amazon_domain}/",
+            "Referer": self.wishlist_scanner.wishlist_url(),
             "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
-            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Mode": "cors" if is_more else "navigate",
+            "Sec-Fetch-Dest": "empty" if is_more else "document",
             "DNT": "1",
         }
+        if is_more:
+            headers["X-Requested-With"] = "XMLHttpRequest"
+        else:
+            headers["Sec-Fetch-User"] = "?1"
+            headers["Upgrade-Insecure-Requests"] = "1"
         try:
             r = await self.scan_session.get(
                 url,
@@ -1923,36 +1977,42 @@ class MonitorWorker(QThread):
                 allow_redirects=True,
             )
             if r.status_code >= 400:
-                return {}, f"HTTP {r.status_code}"
+                return {}, f"HTTP {r.status_code}", ""
             html = r.text or ""
             html_lower = html.lower()
             if "captcha" in html_lower or "robot check" in html_lower:
-                return {}, "Blocked/Captcha"
-            return self.wishlist_scanner.parse_wishlist(html), ""
+                return {}, "Blocked/Captcha", ""
+            return (
+                self.wishlist_scanner.parse_wishlist(html),
+                "",
+                extract_show_more_url(html),
+            )
         except Exception as e:
             err = str(e).lower()
             if "timed out" in err or "timeout" in err:
-                return {}, "Timeout"
+                return {}, "Timeout", ""
             if "could not resolve" in err or "connection" in err:
-                return {}, "Connection error"
-            return {}, "Network error"
+                return {}, "Connection error", ""
+            return {}, "Network error", ""
 
     async def wishlist_http_scanner_forever(
         self,
         proxies: List[Optional[str]],
     ) -> None:
-        """Parallel HTTP wishlist scanner — the speed-killer feature.
+        """Paginated HTTP wishlist crawler — the primary stock detector.
 
-        Fires anonymous HTTP wishlist fetches through the rotating
-        proxy pool every WISHLIST_HTTP_STAGGER_SECONDS. Each request
-        has a unique cache-busting query param so CloudFront has to
-        miss its edge cache and forward to Amazon's origin, where the
-        wishlist HTML is rendered live with current stock state.
+        Amazon only server-renders the first ~10 items of a wishlist and
+        lazy-loads the rest, so a single fetch misses everything past the
+        first page. Each cycle this walks the full "show more" chain
+        (page 1 → page 2 → ... via the paginationToken) through the
+        rotating proxy pool, cache-busting every request, and merges each
+        page into the rolling view (WISHLIST_MERGE_TTL_SECONDS) so a
+        page that gets momentarily blocked keeps its last-known data.
 
-        Different proxies hit different CloudFront edges. Even if one
-        edge is temporarily stale, another will be fresh. The first
-        scan to confirm a target hit wins the race and fires the ping
-        (deduped via the armed/fired latch in _maybe_announce).
+        Stops each crawl as soon as a page adds no new ASINs (the token
+        wraps and re-serves once the list is exhausted) or the page cap
+        is hit. Every page gets a few proxy retries before we skip it
+        for the cycle.
 
         Wishlist must be public for this to work (no auth headers).
         """
@@ -1964,59 +2024,79 @@ class MonitorWorker(QThread):
             rotation = [None]
 
         self.log.emit(
-            f"HTTP wishlist fan-out launching: {len(rotation)} proxies "
-            f"@ {WISHLIST_HTTP_STAGGER_SECONDS}s stagger "
-            f"(eff. freshness floor ~{WISHLIST_HTTP_STAGGER_SECONDS*1000:.0f}ms)."
+            f"HTTP wishlist crawler launching: {len(rotation)} proxies, "
+            f"paginated full-list walk (up to {WISHLIST_MAX_PAGES} pages/cycle)."
         )
 
-        idx = 0
-        inflight: set = set()
+        domain = self.wishlist_scanner.amazon_domain
+        proxy_idx = 0
 
-        async def one_probe(proxy: Optional[str], cb_ms: int) -> None:
-            try:
-                base_url = self.wishlist_scanner.wishlist_url()
-                sep = "&" if "?" in base_url else "?"
-                bust_url = f"{base_url}{sep}_={cb_ms}"
-                parsed_results, status = await self._fetch_wishlist_url(bust_url, proxy)
-                if not status:
-                    self._process_wishlist_results(
-                        parsed_results, source=f"http/{proxy_label_from_url(proxy)}"
-                    )
-            except Exception as e:
-                self.log.emit(f"HTTP wishlist probe error ({proxy}): {e}")
+        def next_proxy() -> Optional[str]:
+            nonlocal proxy_idx
+            for _ in range(len(rotation)):
+                p = rotation[proxy_idx % len(rotation)]
+                proxy_idx += 1
+                if p is None or self.is_proxy_available(proxy_label_from_url(p)):
+                    return p
+            # everything cooling down — just return the next one
+            p = rotation[proxy_idx % len(rotation)]
+            proxy_idx += 1
+            return p
 
         while self.running:
+            cycle_start = time.monotonic()
             try:
-                proxy = rotation[idx % len(rotation)]
-                idx += 1
-                cb_ms = int(time.time() * 1000)
+                url = self.wishlist_scanner.wishlist_url()
+                seen_this_cycle: set = set()
+                pages = 0
+                for _page in range(WISHLIST_MAX_PAGES):
+                    parsed = None
+                    more = ""
+                    # Retry this page across a few proxies before giving up.
+                    for _try in range(WISHLIST_PAGE_RETRIES):
+                        if not self.running:
+                            break
+                        proxy = next_proxy()
+                        cb = int(time.time() * 1000)
+                        sep = "&" if "?" in url else "?"
+                        p_parsed, status, p_more = await self._fetch_wishlist_url(
+                            f"{url}{sep}_={cb}", proxy
+                        )
+                        if not status:
+                            parsed, more = p_parsed, p_more
+                            break
+                    if parsed is None:
+                        # Page blocked after retries — merge+TTL keeps its
+                        # prior items alive; move on and retry next cycle.
+                        break
 
-                if (
-                    proxy
-                    and not self.is_proxy_available(proxy_label_from_url(proxy))
-                ):
-                    await asyncio.sleep(WISHLIST_HTTP_STAGGER_SECONDS)
-                    continue
+                    self._process_wishlist_results(parsed, source="crawl")
+                    new = set(parsed.keys()) - seen_this_cycle
+                    seen_this_cycle |= set(parsed.keys())
+                    pages += 1
+                    if not more or not new:
+                        break
+                    url = (domain + more) if more.startswith("/") else more
 
-                if proxy in inflight:
-                    await asyncio.sleep(WISHLIST_HTTP_STAGGER_SECONDS)
-                    continue
-
-                inflight.add(proxy)
-
-                async def runner(p=proxy, c=cb_ms):
-                    try:
-                        await one_probe(p, c)
-                    finally:
-                        inflight.discard(p)
-
-                task = asyncio.create_task(runner())
-                self.background_tasks.add(task)
-                task.add_done_callback(self.background_tasks.discard)
+                if pages:
+                    self._last_crawl_pages = pages
+                    self._last_crawl_items = len(seen_this_cycle)
+                    # Throttled coverage log (~once/30s) so it's visible
+                    # the crawl is pulling the whole list, not just page 1.
+                    now_mono = time.monotonic()
+                    if now_mono - getattr(self, "_last_crawl_log", 0) >= 30:
+                        self._last_crawl_log = now_mono
+                        self.log.emit(
+                            f"🧭 Wishlist crawl: {len(seen_this_cycle)} items "
+                            f"across {pages} page(s)."
+                        )
             except Exception as e:
-                self.log.emit(f"HTTP wishlist scanner tick error: {e}")
+                self.log.emit(f"Wishlist crawl error: {e}")
 
-            await asyncio.sleep(WISHLIST_HTTP_STAGGER_SECONDS)
+            elapsed = time.monotonic() - cycle_start
+            await asyncio.sleep(
+                max(WISHLIST_CYCLE_MIN_SLEEP, WISHLIST_CYCLE_SECONDS - elapsed)
+            )
 
     # ------------------------------------------------------------------
     # Background helpers
