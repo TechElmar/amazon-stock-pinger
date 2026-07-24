@@ -106,6 +106,18 @@ WISHLIST_PAGE_RETRIES = 4
 WISHLIST_CYCLE_SECONDS = 0.5
 WISHLIST_CYCLE_MIN_SLEEP = 0.2
 
+# The pagination tokens are chained (page N's URL comes from page N-1's
+# response), so the FIRST crawl must walk sequentially. But the page
+# URLs stay valid as long as the list's contents/order don't change, so
+# subsequent cycles fetch every known page CONCURRENTLY (one proxy each)
+# — cutting a full sweep from ~3s to ~1s. We re-walk sequentially every
+# WISHLIST_REDISCOVER_SECONDS to refresh the chain, and immediately if a
+# parallel cycle's coverage collapses (a sign the tokens went stale).
+WISHLIST_REDISCOVER_SECONDS = 60
+# How often to emit the coverage log line (the crawl runs many cycles
+# per second; we don't want a log line every cycle).
+WISHLIST_CRAWL_LOG_SECONDS = 30
+
 # Extracts the "show more" pagination URL from a wishlist page/fragment.
 _SHOW_MORE_RE = re.compile(r'"showMoreUrl"\s*:\s*"([^"]+)"')
 
@@ -963,6 +975,9 @@ class MonitorWorker(QThread):
         # Diagnostics for the paginated crawler (last completed cycle).
         self._last_crawl_pages: int = 0
         self._last_crawl_items: int = 0
+        # Cached page-URL chain for parallel fetching, discovered by the
+        # periodic sequential walk. Empty forces a fresh discovery.
+        self._wl_page_urls: List[str] = []
 
         # Shared refs set in run_async.
         self.notifier: Optional["DiscordNotifier"] = None
@@ -2043,52 +2058,91 @@ class MonitorWorker(QThread):
             proxy_idx += 1
             return p
 
+        async def fetch_page(page_url: str):
+            """Fetch one wishlist page, retrying across a few proxies.
+            Returns (parsed_items | None, next_page_url)."""
+            for _try in range(WISHLIST_PAGE_RETRIES):
+                if not self.running:
+                    return None, ""
+                proxy = next_proxy()
+                cb = int(time.time() * 1000)
+                sep = "&" if "?" in page_url else "?"
+                parsed, status, more = await self._fetch_wishlist_url(
+                    f"{page_url}{sep}_={cb}", proxy
+                )
+                if not status:
+                    return parsed, more
+            return None, ""  # blocked after retries — merge+TTL covers it
+
+        async def discover():
+            """Sequential walk of the show-more chain. Returns the list
+            of page URLs that contributed items + the set of ASINs seen."""
+            url = self.wishlist_scanner.wishlist_url()
+            page_urls: List[str] = []
+            seen: set = set()
+            for _page in range(WISHLIST_MAX_PAGES):
+                parsed, more = await fetch_page(url)
+                if parsed is None:
+                    break
+                self._process_wishlist_results(parsed, source="crawl")
+                new = set(parsed.keys()) - seen
+                if new:
+                    page_urls.append(url)
+                seen |= set(parsed.keys())
+                if not more or not new:
+                    break
+                url = (domain + more) if more.startswith("/") else more
+            return page_urls, seen
+
+        async def fetch_parallel(page_urls: List[str]):
+            """Fetch all known pages concurrently (one proxy each), merge."""
+            async def one(u):
+                parsed, _more = await fetch_page(u)
+                if parsed:
+                    self._process_wishlist_results(parsed, source="crawl-par")
+                    return set(parsed.keys())
+                return set()
+            got = await asyncio.gather(*[one(u) for u in page_urls])
+            seen: set = set()
+            for s in got:
+                seen |= s
+            return seen
+
+        last_discovery = 0.0
         while self.running:
             cycle_start = time.monotonic()
             try:
-                url = self.wishlist_scanner.wishlist_url()
-                seen_this_cycle: set = set()
-                pages = 0
-                for _page in range(WISHLIST_MAX_PAGES):
-                    parsed = None
-                    more = ""
-                    # Retry this page across a few proxies before giving up.
-                    for _try in range(WISHLIST_PAGE_RETRIES):
-                        if not self.running:
-                            break
-                        proxy = next_proxy()
-                        cb = int(time.time() * 1000)
-                        sep = "&" if "?" in url else "?"
-                        p_parsed, status, p_more = await self._fetch_wishlist_url(
-                            f"{url}{sep}_={cb}", proxy
-                        )
-                        if not status:
-                            parsed, more = p_parsed, p_more
-                            break
-                    if parsed is None:
-                        # Page blocked after retries — merge+TTL keeps its
-                        # prior items alive; move on and retry next cycle.
-                        break
+                need_discovery = (
+                    not self._wl_page_urls
+                    or cycle_start - last_discovery >= WISHLIST_REDISCOVER_SECONDS
+                )
+                if need_discovery:
+                    page_urls, seen = await discover()
+                    if page_urls:
+                        self._wl_page_urls = page_urls
+                        # Baseline coverage from the authoritative walk.
+                        self._last_crawl_items = len(seen)
+                    last_discovery = cycle_start
+                    mode = "seq"
+                else:
+                    seen = await fetch_parallel(self._wl_page_urls)
+                    mode = "par"
+                    # Coverage collapsed → tokens likely went stale; force a
+                    # fresh sequential discovery on the next cycle.
+                    if (
+                        self._last_crawl_items
+                        and len(seen) < self._last_crawl_items * 0.5
+                    ):
+                        self._wl_page_urls = []
 
-                    self._process_wishlist_results(parsed, source="crawl")
-                    new = set(parsed.keys()) - seen_this_cycle
-                    seen_this_cycle |= set(parsed.keys())
-                    pages += 1
-                    if not more or not new:
-                        break
-                    url = (domain + more) if more.startswith("/") else more
-
-                if pages:
-                    self._last_crawl_pages = pages
-                    self._last_crawl_items = len(seen_this_cycle)
-                    # Throttled coverage log (~once/30s) so it's visible
-                    # the crawl is pulling the whole list, not just page 1.
+                self._last_crawl_pages = len(self._wl_page_urls)
+                if seen:
                     now_mono = time.monotonic()
-                    if now_mono - getattr(self, "_last_crawl_log", 0) >= 30:
+                    if now_mono - getattr(self, "_last_crawl_log", 0) >= WISHLIST_CRAWL_LOG_SECONDS:
                         self._last_crawl_log = now_mono
                         self.log.emit(
-                            f"🧭 Wishlist crawl: {len(seen_this_cycle)} items "
-                            f"across {pages} page(s)."
+                            f"🧭 Wishlist crawl [{mode}]: {len(seen)} items "
+                            f"across {self._last_crawl_pages} page(s)."
                         )
             except Exception as e:
                 self.log.emit(f"Wishlist crawl error: {e}")
