@@ -157,10 +157,12 @@ class DiscordNotifier:
         return " ".join(parts) + f" · `{item['asin']}`"
 
     def _digest_header(self, k, n, total_items):
-        now = datetime.now().strftime("%Y-%m-%d %I:%M %p").replace(" 0", " ")
+        # Date only — no clock time. The list refreshes daily and viewers
+        # span multiple timezones, so a wall-clock time is just noise.
+        today = datetime.now().strftime("%B %d, %Y")
         lines = [
             "# Amazon Stock Watchlist",
-            f"Updated: {now}",
+            f"Updated: {today}",
             f"{total_items} purchasable item{'s' if total_items != 1 else ''}",
         ]
         if n > 1:
