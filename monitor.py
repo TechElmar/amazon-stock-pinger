@@ -191,6 +191,23 @@ DIGEST_INTERVAL_SECONDS = 24 * 60 * 60     # one digest per day
 # after a restart would claim nothing is in stock.
 DIGEST_STARTUP_WARMUP_SECONDS = 180
 
+# Amazon Associates affiliate tag appended to every product link the
+# bot posts to Discord (stock-list buttons + target-alert buttons).
+# Set to "" to disable. Amazon's `tag=` param credits this associate
+# for any resulting purchase. Not a secret — it appears in every public
+# link — so it lives in code rather than an env var.
+AFFILIATE_TAG = "shaunms-20"
+
+
+def with_affiliate_tag(url: str) -> str:
+    """Append the Associates tag to a product URL (no-op if the tag is
+    empty, the URL is blank, or it already carries a tag)."""
+    if not AFFILIATE_TAG or not url or "tag=" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}tag={AFFILIATE_TAG}"
+
+
 # ===================== AMAZON-SELLER GATE =====================
 # Pings only fire for stock that is SOLD BY AMAZON (Amazon.ca /
 # Amazon.com retail). Third-party sellers holding the buy box —
@@ -1327,7 +1344,7 @@ class MonitorWorker(QThread):
             "asin": asin,
             "price": result.get("price", ""),
             "reason": reason,
-            "url": result.get("url", ""),
+            "url": with_affiliate_tag(result.get("url", "")),
             "image_url": result.get("image_url", ""),
             "seller": seller,
         }
@@ -2232,7 +2249,7 @@ class MonitorWorker(QThread):
                 "price_number": (
                     float(price_number) if price_number is not None else None
                 ),
-                "url": url,
+                "url": with_affiliate_tag(url),
                 "image_url": live.get("image_url") or "",
                 "target": float(prod.get("target_price") or 0),
             })
