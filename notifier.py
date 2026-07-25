@@ -6,6 +6,14 @@ from urllib.parse import urlparse
 TARGET_ALERT_COLOR = 0xf59e0b   # amber — "act now" signal
 DIGEST_COLOR = 0x3b82f6         # calm blue — informational (fallback embeds)
 
+# Target alerts ping this Discord role (opt-in "Amazon Notifications"
+# role) instead of @everyone. Discord pings roles by numeric ID, not
+# name, so we emit <@&ID> and whitelist the role in allowed_mentions
+# (which makes it ping even if the role isn't marked "mentionable").
+# Role IDs are not secret. Set to "" to fall back to @everyone.
+PING_ROLE_ID = "1502822024358264843"
+PING_MENTION = f"<@&{PING_ROLE_ID}>" if PING_ROLE_ID else "@everyone"
+
 # Stock-list layout (Discord Components V2). Each product block costs
 # 6 components (section + text + thumbnail + action row + button +
 # separator) and Discord caps a message at ~40 components, so 6
@@ -83,12 +91,13 @@ class DiscordNotifier:
         url,
         image_url="",
         seller="",
-        mention="@everyone",
+        mention=PING_MENTION,
     ):
-        """@everyone ping: item hit its target price (Amazon-sold,
-        confirmed in stock). Deliberately does NOT reveal what the
-        target price is — the armed/fired latch in the monitor
-        guarantees this doesn't repeat while the item sits at target."""
+        """Role ping (Amazon Notifications) when an item hits its target
+        price (Amazon-sold, confirmed in stock). Deliberately does NOT
+        reveal what the target price is — the armed/fired latch in the
+        monitor guarantees this doesn't repeat while the item sits at
+        target."""
         if not self.webhook_url:
             return False, "Webhook is empty."
 
@@ -134,6 +143,11 @@ class DiscordNotifier:
                 }
             ],
         }
+        # Whitelist ONLY the notify role so the <@&ID> in content actually
+        # pings it (works even if the role isn't "mentionable"), while
+        # suppressing any accidental @everyone/@here/user pings.
+        if PING_ROLE_ID:
+            payload["allowed_mentions"] = {"roles": [PING_ROLE_ID]}
         return await self._post(session, payload, "target alert")
 
     # ------------------------------------------------------------------
@@ -142,16 +156,15 @@ class DiscordNotifier:
 
     @staticmethod
     def _price_line(item, prev_prices):
-        """'🟢 **$49.98** (was $59.95) · `ASIN`' — green when the price
-        held or dropped since the last list, red when it rose, no
-        circle when there's no history."""
+        """'🟢 **$49.98** (was $59.95) · `ASIN`'. The circle is ALWAYS
+        green — everything on this list is in stock, so a green dot is
+        just the in-stock indicator (no red/absent variants, which read
+        as confusing). The '(was $X)' note still shows when the price
+        moved since the previous list."""
         price = item.get("price") or "—"
         pn = item.get("price_number")
         prev = (prev_prices or {}).get(item["asin"])
-        parts = []
-        if pn is not None and prev is not None:
-            parts.append("🟢" if pn <= prev else "🔴")
-        parts.append(f"**{price}**")
+        parts = ["🟢", f"**{price}**"]
         if pn is not None and prev is not None and abs(pn - prev) >= 0.01:
             parts.append(f"(was ${prev:.2f})")
         return " ".join(parts) + f" · `{item['asin']}`"

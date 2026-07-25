@@ -2256,16 +2256,12 @@ class MonitorWorker(QThread):
         items.sort(key=lambda it: (it["title"] or "").lower())
         return items
 
-    def _send_digest(self) -> None:
-        """Build + send the stock-list message, latch every at-target
-        item on it (being on today's list IS its announcement — it must
-        not ping), persist price history for the (was $X) markers, and
-        open the gate for live target hunting."""
-        items = self._build_digest_items()
-
-        # LATCH: anything on today's list at/below its target can no
-        # longer ping. Genuinely new events (1h+ OOS comeback, price
-        # re-entering the target zone from >5% above) re-arm as usual.
+    def _latch_at_target(self, items: list) -> int:
+        """Latch every at-target in-stock item as 'fired' so it can't
+        ping — an item already in stock at/below target isn't a fresh
+        drop worth an @role. Genuinely new events (a ≥1h OOS comeback,
+        or the price re-entering the target zone from >5% above) re-arm
+        it as usual. Returns how many were newly latched."""
         latched = 0
         for it in items:
             target = it.get("target") or 0
@@ -2278,8 +2274,16 @@ class MonitorWorker(QThread):
             ):
                 self._set_alert_state(it["asin"], "fired")
                 latched += 1
+        return latched
 
-        # Price history from the previous list → (was $X) + 🟢/🔴.
+    def _send_digest(self) -> None:
+        """Build + send the stock-list message (the 24h list), latch
+        every at-target item on it, persist price history for the
+        (was $X) markers, and stamp last_digest_at."""
+        items = self._build_digest_items()
+        latched = self._latch_at_target(items)
+
+        # Price history from the previous list → (was $X).
         try:
             prev_prices = {
                 k: float(v)
@@ -2310,25 +2314,28 @@ class MonitorWorker(QThread):
             self.log.emit(f"Digest price-history save error: {e}")
         self.db.set_setting("last_digest_at", str(time.time()))
 
-        # Gate open: from this moment, target hunting is live.
+        # Safety: keep the gate open (startup opens it; this is a no-op
+        # once live, but guards a fresh-install first-send path).
         self._startup_sweep_done = True
         self.log.emit(
-            f"📦 Stock list sent — {len(items)} purchasable item(s), "
-            f"{latched} at-target item(s) latched (no ping). "
-            f"Live target hunting is now ACTIVE."
+            f"📦 Stock list sent (24h) — {len(items)} purchasable "
+            f"item(s), {latched} at-target item(s) latched (no ping)."
         )
 
     async def daily_digest_loop(self) -> None:
-        """Startup sweep → boot stock list → daily refresh.
+        """Startup housekeeping → 24h stock list.
 
-        Phase 1: wait DIGEST_STARTUP_WARMUP_SECONDS while the scanners
-        do a full pass over the watchlist (pings are impossible during
-        this window — see _maybe_announce), then ALWAYS send the stock
-        list, regardless of when the previous one went out.
+        Phase 1 (every boot): wait DIGEST_STARTUP_WARMUP_SECONDS while
+        the scanners do a full pass, then latch at-target in-stock items
+        (so they can't false-ping) and open the ping gate — WITHOUT
+        sending a Discord message. This is why restarting to deploy
+        updates no longer spams the channel with a fresh stock list.
 
-        Phase 2: resend every DIGEST_INTERVAL_SECONDS (persisted in
-        settings so the cadence survives restarts... though a restart
-        also triggers a fresh boot list, which resets the 24h clock).
+        Phase 2: send the stock list only when DIGEST_INTERVAL_SECONDS
+        has elapsed since the last one (persisted as last_digest_at), so
+        the list is a true once-per-24h post, independent of restarts.
+        A fresh install (no last_digest_at) posts one shortly after boot
+        to establish the baseline.
         """
         started = time.monotonic()
         while self.running and (
@@ -2338,11 +2345,20 @@ class MonitorWorker(QThread):
         if not self.running:
             return
 
+        # Startup housekeeping: latch + open the gate, but do NOT send.
         try:
-            self._send_digest()
+            items = self._build_digest_items()
+            latched = self._latch_at_target(items)
+            self.log.emit(
+                f"🧹 Startup sweep complete — {len(items)} item(s) in "
+                f"stock, {latched} at-target latched (no ping). Boot "
+                f"stock-list suppressed; it posts on the 24h schedule."
+            )
         except Exception as e:
-            self.log.emit(f"Digest error: {e}")
-            # Never leave the ping gate locked because the list failed.
+            self.log.emit(f"Startup latch error: {e}")
+        finally:
+            # Always open the gate so target hunting goes live even if
+            # the latch pass hit an error.
             self._startup_sweep_done = True
 
         while self.running:
