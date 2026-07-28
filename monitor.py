@@ -106,6 +106,14 @@ WISHLIST_PAGE_RETRIES = 4
 WISHLIST_CYCLE_SECONDS = 0.5
 WISHLIST_CYCLE_MIN_SLEEP = 0.2
 
+# BURST-CONFIRM: the instant a targeted, armed item first reads in stock
+# at/below its target, the crawler drops into a short high-rate window so
+# the SECOND (confirming) read lands in a fraction of a second instead of
+# waiting out drop-time block storms. The 2-read false-ping guard stays
+# fully intact — this only makes confirm #2 fast, never skips it.
+WISHLIST_BURST_SECONDS = 3.0    # how long one candidate keeps the crawl hot
+WISHLIST_BURST_SLEEP = 0.1      # inter-cycle gap while bursting
+
 # The pagination tokens are chained (page N's URL comes from page N-1's
 # response), so the FIRST crawl must walk sequentially. But the page
 # URLs stay valid as long as the list's contents/order don't change, so
@@ -995,6 +1003,10 @@ class MonitorWorker(QThread):
         # Cached page-URL chain for parallel fetching, discovered by the
         # periodic sequential walk. Empty forces a fresh discovery.
         self._wl_page_urls: List[str] = []
+        # Burst-confirm deadline (monotonic). While now < this, the
+        # wishlist crawler runs at WISHLIST_BURST_SLEEP cadence to race
+        # the confirming read of a targeted item that just went in stock.
+        self._wishlist_burst_until: float = 0.0
 
         # Shared refs set in run_async.
         self.notifier: Optional["DiscordNotifier"] = None
@@ -1637,6 +1649,25 @@ class MonitorWorker(QThread):
                 f"{hours}h {mins}m without Amazon stock."
             )
 
+        # BURST-CONFIRM: this scan saw the item in stock, but effective
+        # state hasn't flipped yet (the confirm streak is mid-way). If
+        # it's a real, armed ping candidate at/below target, kick the
+        # wishlist crawler into a short high-rate burst so the confirming
+        # read lands fast — before a drop-time block storm can stall it.
+        # This never lowers IN_STOCK_CONFIRM_SCANS; it only speeds the
+        # arrival of confirm #2.
+        if observation == "in_stock" and new_eff != "in_stock":
+            pn = result.get("price_number")
+            if (
+                pn is not None
+                and target and target > 0
+                and pn <= target
+                and self.alert_state.get(asin, "armed") == "armed"
+            ):
+                self._wishlist_burst_until = (
+                    time.monotonic() + WISHLIST_BURST_SECONDS
+                )
+
         # HARD GATE: a ping can only fire off a scan that is itself a
         # seller-confirmed Amazon in-stock read, with the confirmed
         # effective state agreeing. (3P / unknown-seller / error scans
@@ -2165,9 +2196,14 @@ class MonitorWorker(QThread):
                 self.log.emit(f"Wishlist crawl error: {e}")
 
             elapsed = time.monotonic() - cycle_start
-            await asyncio.sleep(
-                max(WISHLIST_CYCLE_MIN_SLEEP, WISHLIST_CYCLE_SECONDS - elapsed)
-            )
+            if time.monotonic() < self._wishlist_burst_until:
+                # A targeted item is one confirming read away — crawl hard
+                # so effective state flips (and the ping fires) fast.
+                await asyncio.sleep(WISHLIST_BURST_SLEEP)
+            else:
+                await asyncio.sleep(
+                    max(WISHLIST_CYCLE_MIN_SLEEP, WISHLIST_CYCLE_SECONDS - elapsed)
+                )
 
     # ------------------------------------------------------------------
     # Background helpers
