@@ -193,6 +193,23 @@ MIN_RESTOCK_OOS_SECONDS = 60 * 60          # OOS run needed to re-arm
 TARGET_REARM_MARGIN = 0.05                 # price must exceed target by 5%
 MIN_TARGET_REPING_SECONDS = 3 * 60 * 60    # ≥3h between pings per item
 
+# SAME-PRICE SUPPRESSION — the anti-nag rule.
+#
+# An item that permanently sits at/below target (common: a $39.95 item
+# with a $40 target) used to re-ping every few hours forever. Amazon's
+# listing flickers out of stock for an hour or more — sometimes real,
+# sometimes just Amazon showing a temporary "unavailable" — the restock
+# rule re-arms it, and it re-fires at the exact same price. The channel
+# reads it as spam, because nothing actually changed.
+#
+# The only genuinely new things worth an @role are: the price DROPPED
+# below what we last announced, or the item was truly gone long enough
+# that its return is real news. So a re-ping at the SAME (or higher)
+# price than the last announced one needs a much longer quiet period;
+# any real price drop bypasses it instantly.
+SAME_PRICE_REPING_SECONDS = 24 * 60 * 60   # ≥24h between identical pings
+PRICE_DROP_EPSILON = 0.01                  # cents of noise = not a drop
+
 DIGEST_INTERVAL_SECONDS = 24 * 60 * 60     # one digest per day
 # Don't send an overdue digest until the scanners have had time to
 # establish real stock state after boot — otherwise the first digest
@@ -1027,9 +1044,17 @@ class MonitorWorker(QThread):
         # MIN_TARGET_REPING_SECONDS even across re-arms. Rehydrated
         # from products.last_pinged_at at startup.
         self.last_target_ping_at: Dict[str, float] = {}
+        # Price we last ANNOUNCED per ASIN (ping or stock-list latch).
+        # Drives SAME_PRICE_REPING_SECONDS: re-announcing the same price
+        # is nagging, a lower price is real news. Rehydrated from
+        # products.last_pinged_price at startup.
+        self.last_pinged_price: Dict[str, float] = {}
         # ASINs whose target hit is being held by the re-ping cooldown
         # (used to log the suppression exactly once, not per scan).
         self._cooldown_logged: set = set()
+        # ASINs whose repeat ping is held by same-price suppression
+        # (logged once per hold, not per scan).
+        self._same_price_logged: set = set()
 
         # STARTUP SWEEP GUARD. False until the boot stock-list message
         # has been sent. While False, NO target ping can fire — the
@@ -1718,6 +1743,28 @@ class MonitorWorker(QThread):
                 )
             return False, ""
 
+        # SAME-PRICE SUPPRESSION (anti-nag). We already announced this
+        # item at this price (or cheaper). A flickery listing that keeps
+        # bouncing OOS→in-stock would otherwise re-fire the identical
+        # ping every few hours. Only a real price DROP, or a full
+        # SAME_PRICE_REPING_SECONDS of quiet, gets to speak again.
+        prev_announced = self.last_pinged_price.get(asin)
+        if (
+            prev_announced is not None
+            and price_number >= prev_announced - PRICE_DROP_EPSILON
+            and time.time() - last_ping < SAME_PRICE_REPING_SECONDS
+        ):
+            if asin not in self._same_price_logged:
+                self._same_price_logged.add(asin)
+                hrs = (SAME_PRICE_REPING_SECONDS - (time.time() - last_ping)) / 3600
+                self.log.emit(
+                    f"🔁 {asin} at target but already announced at "
+                    f"${prev_announced:.2f} — same price, no re-ping "
+                    f"(~{hrs:.1f}h left, or any drop below "
+                    f"${prev_announced:.2f} fires immediately)."
+                )
+            return False, ""
+
         # Reason strings deliberately never reveal the target price.
         if restock_comeback:
             reason = "Restocked — Target Price Reached"
@@ -1764,6 +1811,10 @@ class MonitorWorker(QThread):
         self._cooldown_logged.discard(asin)
 
         price_number = float(result.get("price_number") or 0)
+        # Remember what we announced — a later ping at this same price
+        # is nagging, one at a lower price is real news.
+        self.last_pinged_price[asin] = price_number
+        self._same_price_logged.discard(asin)
         ts_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             self.db.save_ping(asin, price_number, ts_iso)
@@ -2309,6 +2360,12 @@ class MonitorWorker(QThread):
                 and self.alert_state.get(it["asin"]) != "fired"
             ):
                 self._set_alert_state(it["asin"], "fired")
+                # Appearing on the stock list IS this item's
+                # announcement — record price + time so the same-price
+                # rule treats it exactly like a ping. A later drop
+                # below this price still fires immediately.
+                self.last_pinged_price[it["asin"]] = float(pn)
+                self.last_target_ping_at.setdefault(it["asin"], time.time())
                 latched += 1
         return latched
 
@@ -2533,6 +2590,16 @@ class MonitorWorker(QThread):
                 if latch in ("armed", "fired"):
                     self.alert_state[asin] = latch
                     restored += 1
+
+                # Last announced price — without this the same-price
+                # rule would forget across restarts and every deploy
+                # would re-open the nag window.
+                lpp = prod.get("last_pinged_price")
+                if lpp is not None:
+                    try:
+                        self.last_pinged_price[asin] = float(lpp)
+                    except (TypeError, ValueError):
+                        pass
 
                 lpa = prod.get("last_pinged_at")
                 if lpa:
