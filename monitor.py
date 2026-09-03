@@ -2364,8 +2364,22 @@ class MonitorWorker(QThread):
                 # announcement — record price + time so the same-price
                 # rule treats it exactly like a ping. A later drop
                 # below this price still fires immediately.
-                self.last_pinged_price[it["asin"]] = float(pn)
-                self.last_target_ping_at.setdefault(it["asin"], time.time())
+                asin = it["asin"]
+                self.last_pinged_price[asin] = float(pn)
+                if asin not in self.last_target_ping_at:
+                    self.last_target_ping_at[asin] = time.time()
+                # PERSIST it: in-memory only would mean the next restart
+                # forgets what we announced and re-opens the nag window.
+                try:
+                    self.db.save_ping(
+                        asin,
+                        float(pn),
+                        datetime.fromtimestamp(
+                            self.last_target_ping_at[asin]
+                        ).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                except Exception as e:
+                    self.log.emit(f"DB latch-announce save error: {e}")
                 latched += 1
         return latched
 
