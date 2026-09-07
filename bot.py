@@ -57,13 +57,47 @@ DIGEST_COLOR = 0x3B82F6    # blue — informational
 OK_COLOR = 0x22C55E
 ERR_COLOR = 0xEF4444
 
-DIGEST_ITEMS_PER_EMBED = 8   # fields per digest embed
-MAX_BUTTONS = 25             # Discord hard cap: 5 rows x 5 buttons
+DIGEST_ITEMS_PER_EMBED = 8   # fields per digest embed (fallback path)
+# Components V2 caps a message at ~40 components. Each product block
+# costs 3 (section + action row + separator), so 6 per message is safe.
+DIGEST_ITEMS_PER_PART = 6
+
+
+# Components V2 ("LayoutView") lands in discord.py 2.6+. It's what
+# gives headings, sections with a side thumbnail, separators and
+# stacked button rows — the modern look. Falls back to classic embeds
+# on older libraries.
+LAYOUT_V2 = DISCORD_AVAILABLE and hasattr(discord.ui, "LayoutView")
+
+# Quantity shortcuts on each alert. Amazon's remote "add to cart"
+# endpoint drops the item straight into the cart at this quantity,
+# carrying the affiliate tag through the purchase.
+ATC_QUANTITIES = (1, 2, 3)
 
 
 def _short(text: str, limit: int = 150) -> str:
     text = (text or "").strip()
     return text[: limit - 3].rstrip() + "..." if len(text) > limit else text
+
+
+def _affiliate_tag() -> str:
+    """Single source of truth lives in monitor.py; imported lazily so
+    bot.py has no import-time dependency on it."""
+    try:
+        from monitor import AFFILIATE_TAG
+        return AFFILIATE_TAG or ""
+    except Exception:
+        return ""
+
+
+def _atc_url(asin: str, qty: int, domain: str = "https://www.amazon.ca") -> str:
+    """Amazon's remote add-to-cart link — one click puts `qty` in the
+    cart instead of making people click through the listing first."""
+    url = (
+        f"{domain}/gp/aws/cart/add.html?ASIN.1={asin}&Quantity.1={qty}"
+    )
+    tag = _affiliate_tag()
+    return f"{url}&AssociateTag={tag}" if tag else url
 
 
 def _valid_asin(asin: str) -> bool:
@@ -213,35 +247,9 @@ class StockPingerBot:
         if ch is None:
             return False, "No alert channel configured."
 
-        embed = discord.Embed(
-            title=_short(title, 200) or "Amazon Product",
-            url=url or None,
-            color=ALERT_COLOR,
-            description=f"🎯 **{price or '—'}** · `{asin}`",
-            timestamp=datetime.now().astimezone(),
-        )
-        embed.set_author(name="amazon.ca Price Alert")
-        embed.add_field(
-            name="Reason", value=reason or "Target Price Reached", inline=True
-        )
-        if seller:
-            embed.add_field(name="Seller", value=seller, inline=True)
-        if image_url:
-            embed.set_thumbnail(url=image_url)
-        embed.set_footer(text="Amazon Stock Pinger")
-
-        view = discord.ui.View(timeout=None)
-        if url:
-            view.add_item(discord.ui.Button(
-                style=discord.ButtonStyle.link, label="Product page",
-                url=url, emoji="🛒",
-            ))
-
         # Ping the opt-in role, and ONLY that role.
         from notifier import PING_ROLE_ID
-        content = mention or ""
         if PING_ROLE_ID:
-            content = f"<@&{PING_ROLE_ID}> 🎯 **{_short(title, 120)}** @ {price or '—'}"
             allowed = discord.AllowedMentions(
                 everyone=False, users=False,
                 roles=[discord.Object(id=int(PING_ROLE_ID))],
@@ -250,11 +258,110 @@ class StockPingerBot:
             allowed = discord.AllowedMentions.none()
 
         try:
-            await ch.send(content=content or None, embed=embed, view=view,
-                          allowed_mentions=allowed)
+            if LAYOUT_V2:
+                view = self._alert_layout(
+                    title=title, asin=asin, price=price, reason=reason,
+                    url=url, image_url=image_url, seller=seller,
+                    role_id=PING_ROLE_ID,
+                )
+                # A LayoutView carries the whole message — Discord rejects
+                # content/embeds alongside the Components V2 flag.
+                await ch.send(view=view, allowed_mentions=allowed)
+            else:
+                content, embed, view = self._alert_embed_fallback(
+                    title, asin, price, reason, url, image_url, seller,
+                    PING_ROLE_ID,
+                )
+                await ch.send(content=content or None, embed=embed,
+                              view=view, allowed_mentions=allowed)
             return True, "Bot target alert sent."
         except Exception as e:
             return False, f"Bot target alert failed: {e}"
+
+    # -- alert rendering ------------------------------------------------
+
+    def _alert_layout(self, *, title, asin, price, reason, url,
+                      image_url, seller, role_id):
+        """Components V2 alert: role pill, heading, a section with the
+        product image as a side thumbnail, then quick add-to-cart rows."""
+        ui = discord.ui
+        c = ui.Container(accent_colour=discord.Colour(ALERT_COLOR))
+
+        if role_id:
+            c.add_item(ui.TextDisplay(f"<@&{role_id}>"))
+        c.add_item(ui.TextDisplay("# 🎯 PokeDropz Amazon.ca Restock Alert"))
+        c.add_item(ui.Separator())
+
+        body = (
+            f"**{_short(title, 180) or 'Amazon Product'}**\n"
+            f"🎯 **{price or '—'}** · `{asin}`\n"
+            f"Event: {reason or 'Target Price Reached'}\n"
+            f"Reason: Item is in stock at or below target"
+        )
+        if seller:
+            body += f"\nSeller: {seller}"
+
+        if image_url:
+            c.add_item(ui.Section(
+                ui.TextDisplay(body),
+                accessory=ui.Thumbnail(media=image_url),
+            ))
+        else:
+            c.add_item(ui.TextDisplay(body))
+
+        c.add_item(ui.Separator())
+
+        # Quick add-to-cart row (qty 1/2/3), then the listing.
+        atc = ui.ActionRow()
+        for q in ATC_QUANTITIES:
+            atc.add_item(ui.Button(
+                style=discord.ButtonStyle.link, label=f"ATC {q}",
+                url=_atc_url(asin, q), emoji="🛒",
+            ))
+        c.add_item(atc)
+
+        if url:
+            row = ui.ActionRow()
+            row.add_item(ui.Button(
+                style=discord.ButtonStyle.link, label="Listing",
+                url=url, emoji="📄",
+            ))
+            c.add_item(row)
+
+        view = ui.LayoutView(timeout=None)
+        view.add_item(c)
+        return view
+
+    def _alert_embed_fallback(self, title, asin, price, reason, url,
+                              image_url, seller, role_id):
+        """Classic embed, used only on discord.py < 2.6."""
+        embed = discord.Embed(
+            title=_short(title, 200) or "Amazon Product",
+            url=url or None, color=ALERT_COLOR,
+            description=f"🎯 **{price or '—'}** · `{asin}`",
+            timestamp=datetime.now().astimezone(),
+        )
+        embed.set_author(name="amazon.ca Price Alert")
+        embed.add_field(name="Reason",
+                        value=reason or "Target Price Reached", inline=True)
+        if seller:
+            embed.add_field(name="Seller", value=seller, inline=True)
+        if image_url:
+            embed.set_thumbnail(url=image_url)
+        view = discord.ui.View(timeout=None)
+        for q in ATC_QUANTITIES:
+            view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link, label=f"ATC {q}",
+                url=_atc_url(asin, q), emoji="🛒"))
+        if url:
+            view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link, label="Listing",
+                url=url, emoji="📄"))
+        content = (
+            f"<@&{role_id}> 🎯 **{_short(title, 120)}** @ {price or '—'}"
+            if role_id else ""
+        )
+        return content, embed, view
 
     async def send_digest(self, session=None, *, items, prev_prices=None):
         """The stock list. No ping."""
@@ -267,43 +374,76 @@ class StockPingerBot:
             return False, "No digest channel configured."
 
         prev_prices = prev_prices or {}
+        per = DIGEST_ITEMS_PER_PART if LAYOUT_V2 else DIGEST_ITEMS_PER_EMBED
         chunks = [
-            items[i:i + DIGEST_ITEMS_PER_EMBED]
-            for i in range(0, len(items), DIGEST_ITEMS_PER_EMBED)
+            items[i:i + per] for i in range(0, len(items), per)
         ] or [[]]
 
         try:
             for k, chunk in enumerate(chunks, 1):
-                embed = discord.Embed(
-                    title="📦 Amazon Stock Watchlist",
-                    color=DIGEST_COLOR,
-                    description=(
-                        f"{len(items)} purchasable item"
-                        f"{'s' if len(items) != 1 else ''}"
-                        + (f" · Part {k}/{len(chunks)}" if len(chunks) > 1 else "")
-                    ),
-                    timestamp=datetime.now().astimezone(),
-                )
-                for it in chunk:
-                    embed.add_field(
-                        name=_short(it.get("title", ""), 240) or it["asin"],
-                        value=self._price_line(it, prev_prices)
-                              + f"\n[View on Amazon]({it['url']})",
-                        inline=False,
+                if LAYOUT_V2:
+                    await ch.send(view=self._digest_layout(
+                        chunk, k, len(chunks), len(items), prev_prices))
+                else:
+                    embed = discord.Embed(
+                        title="📦 Amazon Stock Watchlist", color=DIGEST_COLOR,
+                        description=(
+                            f"{len(items)} purchasable item"
+                            f"{'s' if len(items) != 1 else ''}"
+                            + (f" · Part {k}/{len(chunks)}"
+                               if len(chunks) > 1 else "")
+                        ),
+                        timestamp=datetime.now().astimezone(),
                     )
-                embed.set_footer(text="Amazon Stock Pinger · updates daily")
-
-                view = discord.ui.View(timeout=None)
-                for it in chunk[:5]:
-                    view.add_item(discord.ui.Button(
-                        style=discord.ButtonStyle.link,
-                        label=_short(it.get("title", it["asin"]), 40),
-                        url=it["url"],
-                    ))
-                await ch.send(embed=embed, view=view if len(view.children) else None)
+                    for it in chunk:
+                        embed.add_field(
+                            name=_short(it.get("title", ""), 240) or it["asin"],
+                            value=self._price_line(it, prev_prices)
+                                  + f"\n[View on Amazon]({it['url']})",
+                            inline=False,
+                        )
+                    await ch.send(embed=embed)
             return True, f"Bot stock list sent — {len(items)} item(s)."
         except Exception as e:
             return False, f"Bot digest failed: {e}"
+
+    def _digest_layout(self, chunk, k, n, total, prev_prices):
+        """Components V2 stock list: heading, then one thumbnailed
+        section + listing button per product, separated by dividers."""
+        ui = discord.ui
+        c = ui.Container(accent_colour=discord.Colour(DIGEST_COLOR))
+        header = (
+            "# 📦 Amazon Stock Watchlist\n"
+            f"Updated: {datetime.now().strftime('%B %d, %Y')}\n"
+            f"{total} purchasable item{'s' if total != 1 else ''}"
+        )
+        if n > 1:
+            header += f" · Part {k}/{n}"
+        c.add_item(ui.TextDisplay(header))
+        c.add_item(ui.Separator())
+
+        for i, it in enumerate(chunk):
+            body = (f"**{_short(it.get('title', ''), 150) or it['asin']}**\n"
+                    f"{self._price_line(it, prev_prices)}")
+            if it.get("image_url"):
+                c.add_item(ui.Section(
+                    ui.TextDisplay(body),
+                    accessory=ui.Thumbnail(media=it["image_url"]),
+                ))
+            else:
+                c.add_item(ui.TextDisplay(body))
+            row = ui.ActionRow()
+            row.add_item(ui.Button(
+                style=discord.ButtonStyle.link, label="Listing",
+                url=it["url"], emoji="📄",
+            ))
+            c.add_item(row)
+            if i < len(chunk) - 1:
+                c.add_item(ui.Separator())
+
+        view = ui.LayoutView(timeout=None)
+        view.add_item(c)
+        return view
 
     @staticmethod
     def _price_line(item, prev_prices) -> str:
