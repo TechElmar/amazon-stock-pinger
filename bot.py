@@ -578,6 +578,109 @@ class StockPingerBot:
             e.set_footer(text=asin)
             await inter.response.send_message(embed=e, ephemeral=True)
 
+        @tree.command(
+            name="preview",
+            description="Preview a message layout — only you see it, pings nobody",
+        )
+        @app_commands.describe(
+            kind="Which message to preview",
+            asin="Optional: render with a real tracked product's live data",
+        )
+        @app_commands.choices(kind=[
+            app_commands.Choice(name="Target alert", value="alert"),
+            app_commands.Choice(name="Stock list", value="stocklist"),
+        ])
+        @app_commands.default_permissions(manage_guild=True)
+        async def preview(inter: "discord.Interaction",
+                          kind: "app_commands.Choice[str]",
+                          asin: Optional[str] = None):
+            """Safe dry-run of the real renderers.
+
+            Three guarantees, because this bot lives in a large server:
+              1. ephemeral=True  — nobody but the invoker can see it.
+              2. AllowedMentions.none() — the role pill still RENDERS
+                 (so the preview is visually accurate) but Discord sends
+                 zero notifications.
+              3. Read-only — builds a view and returns; touches no
+                 latch, no DB row, no ping state.
+            """
+            sample = {
+                "title": "Pokémon TCG: Mega Evolution—Pitch Black Booster Bundle",
+                "asin": "B0GYTRYV7P", "price": "$49.95",
+                "price_number": 49.95, "seller": "Amazon.ca",
+                "url": "https://www.amazon.ca/dp/B0GYTRYV7P",
+                "image_url": "",
+            }
+
+            # Prefer real live data when an ASIN is given.
+            if asin:
+                a = asin.strip().upper()
+                row = next((p for p in db.get_products() if p["asin"] == a), None)
+                if row is None:
+                    await inter.response.send_message(
+                        f"`{a}` is not tracked — omit the asin to use sample "
+                        f"data, or `/track` it first.", ephemeral=True)
+                    return
+                live = {}
+                if self.worker is not None:
+                    live = dict(self.worker.latest_result.get(a) or {})
+                sample = {
+                    "title": live.get("title") or row.get("title") or a,
+                    "asin": a,
+                    "price": live.get("price") or row.get("last_price") or "—",
+                    "price_number": live.get("price_number")
+                                    or row.get("last_price_number"),
+                    "seller": live.get("seller") or "Amazon.ca",
+                    "url": live.get("url")
+                           or f"https://www.amazon.ca/dp/{a}",
+                    "image_url": live.get("image_url") or "",
+                }
+            try:
+                from monitor import with_affiliate_tag
+                sample["url"] = with_affiliate_tag(sample["url"])
+            except Exception:
+                pass
+
+            from notifier import PING_ROLE_ID
+            try:
+                if kind.value == "alert":
+                    view = self._alert_layout(
+                        title=sample["title"], asin=sample["asin"],
+                        price=sample["price"], reason="Restock Alert",
+                        url=sample["url"], image_url=sample["image_url"],
+                        seller=sample["seller"], role_id=PING_ROLE_ID,
+                    ) if LAYOUT_V2 else None
+                else:
+                    view = self._digest_layout(
+                        [sample], 1, 1, 1, {}) if LAYOUT_V2 else None
+                if view is None:
+                    await inter.response.send_message(
+                        "Components V2 unavailable (discord.py < 2.6) — "
+                        "alerts fall back to classic embeds.", ephemeral=True)
+                    return
+
+                # BOTH guards: invisible to others, and notifies nobody.
+                await inter.response.send_message(
+                    view=view, ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await inter.followup.send(
+                    f"☝️ Preview of the **{kind.name}** layout.\n"
+                    f"• Visible only to you (ephemeral)\n"
+                    f"• **0 notifications sent** — the role pill renders "
+                    f"but pings nobody\n"
+                    f"• Nothing was written to the database",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                # Never let a preview bug surface as a broken interaction.
+                msg = f"Preview failed to render: `{e}`"
+                if inter.response.is_done():
+                    await inter.followup.send(msg, ephemeral=True)
+                else:
+                    await inter.response.send_message(msg, ephemeral=True)
+                self.log(f"🤖 /preview error: {e}")
+
         # ---- mutating commands: server managers only -------------------
 
         @tree.command(name="track",
