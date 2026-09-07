@@ -32,6 +32,26 @@ FLAG_COMPONENTS_V2 = 1 << 15
 ATC_QUANTITIES = (1, 2, 3)
 
 
+# Attribution line on every alert. A Discord handle rather than a URL:
+# the server approved a credit, not a link out of the server.
+#
+# Deliberately plain text, not a real <@id> mention, so it renders as a
+# credit and never pings anyone.
+CREDIT = "Bot developed by @elmar"
+
+
+def _credit_blocks():
+    """Separator plus a small grey credit line, for Components V2 messages.
+
+    '-# ' is Discord's subtext markdown, which renders smaller and dimmer
+    than body text, so the credit reads as a footer rather than content.
+    """
+    return [
+        {"type": 14, "divider": True, "spacing": 1},
+        {"type": 10, "content": f"-# {CREDIT}"},
+    ]
+
+
 def _short(text, limit=150):
     text = (text or "").strip()
     if len(text) > limit:
@@ -189,6 +209,7 @@ class DiscordNotifier:
                     "emoji": {"name": "📄"}, "url": url,
                 }],
             })
+        blocks.extend(_credit_blocks())
 
         payload = {
             "flags": FLAG_COMPONENTS_V2,
@@ -229,6 +250,7 @@ class DiscordNotifier:
             )
         if image_url:
             embed["thumbnail"] = {"url": image_url}
+        embed["footer"] = {"text": CREDIT}
 
         row = [
             {"type": 2, "style": 5, "label": f"ATC {q}",
@@ -309,6 +331,10 @@ class DiscordNotifier:
             })
             if i < len(chunk) - 1:
                 components.append({"type": 14, "divider": True, "spacing": 1})
+        # Only on the final part. A digest split across three messages does
+        # not need the credit repeated three times.
+        if k == n:
+            components.extend(_credit_blocks())
         return {"flags": FLAG_COMPONENTS_V2, "components": components}
 
     def _digest_embed_payload(self, chunk, k, n, total_items, prev_prices):
@@ -333,7 +359,12 @@ class DiscordNotifier:
             if it.get("image_url"):
                 e["thumbnail"] = {"url": it["image_url"]}
             embeds.append(e)
-        return {"embeds": embeds[:10]}
+        out = embeds[:10]
+        # Footer goes on the last embed that actually survives the cap, and
+        # only on the final part, matching the V2 layout above.
+        if k == n and out:
+            out[-1]["footer"] = {"text": CREDIT}
+        return {"embeds": out}
 
     async def send_digest(
         self,
