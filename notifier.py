@@ -27,11 +27,30 @@ DIGEST_ITEMS_PER_PART = 6
 FLAG_COMPONENTS_V2 = 1 << 15
 
 
+# Quantity shortcuts on each alert. Amazon's remote add-to-cart endpoint
+# drops the item straight into the cart, carrying the affiliate tag.
+ATC_QUANTITIES = (1, 2, 3)
+
+
 def _short(text, limit=150):
     text = (text or "").strip()
     if len(text) > limit:
         return text[: limit - 3].rstrip() + "..."
     return text
+
+
+def _atc_url(asin, qty, domain="https://www.amazon.ca"):
+    """One-click add-to-cart at a given quantity. The affiliate tag lives
+    in monitor.py; imported lazily because monitor imports THIS module
+    (a top-level import would be circular)."""
+    url = f"{domain}/gp/aws/cart/add.html?ASIN.1={asin}&Quantity.1={qty}"
+    try:
+        from monitor import AFFILIATE_TAG
+        if AFFILIATE_TAG:
+            url += f"&AssociateTag={AFFILIATE_TAG}"
+    except Exception:
+        pass
+    return url
 
 
 class DiscordNotifier:
@@ -101,12 +120,97 @@ class DiscordNotifier:
         if not self.webhook_url:
             return False, "Webhook is empty."
 
+        # Components V2 first — same layout the bot renders, so servers
+        # reached only by webhook get the identical modern look (heading,
+        # thumbnailed section, separators, ATC + Listing button rows).
+        payload = self._alert_v2_payload(
+            title=title, asin=asin, price=price, reason=reason,
+            url=url, image_url=image_url, seller=seller,
+        )
+        status, body = await self._post_raw(session, payload)
+        if status in (200, 204):
+            return True, "Discord target alert sent."
+        if status != 400:
+            return False, f"Discord target alert failed: {status} {str(body)[:150]}"
+
+        # 400 → this webhook rejected the V2 layout; fall back to embeds
+        # so an alert NEVER goes undelivered over a formatting problem.
+        fb = self._alert_embed_payload(
+            title=title, asin=asin, price=price, reason=reason,
+            url=url, image_url=image_url, seller=seller, mention=mention,
+        )
+        return await self._post(session, fb, "target alert (embed fallback)")
+
+    def _alert_v2_payload(self, *, title, asin, price, reason, url,
+                          image_url, seller):
+        """Container → role pill → H1 heading → section w/ thumbnail →
+        separators → ATC quantity row → Listing row."""
+        blocks = []
+        if PING_ROLE_ID:
+            blocks.append({"type": 10, "content": PING_MENTION})
+        blocks.append({
+            "type": 10,
+            "content": "# 🎯 Amazon.ca Restock Alert",
+        })
+        blocks.append({"type": 14, "divider": True, "spacing": 1})
+
+        body = (
+            f"**{_short(title, 180) or 'Amazon Product'}**\n"
+            f"🎯 **{price or '—'}** · `{asin}`\n"
+            f"Event: {reason or 'Target Price Reached'}\n"
+            f"Reason: Item is in stock at or below target"
+        )
+        if seller:
+            body += f"\nSeller: {seller}"
+
+        if image_url:
+            blocks.append({
+                "type": 9,
+                "components": [{"type": 10, "content": body}],
+                "accessory": {"type": 11, "media": {"url": image_url}},
+            })
+        else:
+            blocks.append({"type": 10, "content": body})
+
+        blocks.append({"type": 14, "divider": True, "spacing": 1})
+        blocks.append({
+            "type": 1,
+            "components": [
+                {"type": 2, "style": 5, "label": f"ATC {q}",
+                 "emoji": {"name": "🛒"}, "url": _atc_url(asin, q)}
+                for q in ATC_QUANTITIES
+            ],
+        })
+        if url:
+            blocks.append({
+                "type": 1,
+                "components": [{
+                    "type": 2, "style": 5, "label": "Listing",
+                    "emoji": {"name": "📄"}, "url": url,
+                }],
+            })
+
+        payload = {
+            "flags": FLAG_COMPONENTS_V2,
+            "components": [{
+                "type": 17,
+                "accent_color": TARGET_ALERT_COLOR,
+                "components": blocks,
+            }],
+        }
+        # Whitelist ONLY the notify role, so the pill actually pings even
+        # when the role isn't "mentionable", and nothing else can.
+        if PING_ROLE_ID:
+            payload["allowed_mentions"] = {"roles": [PING_ROLE_ID]}
+        return payload
+
+    def _alert_embed_payload(self, *, title, asin, price, reason, url,
+                             image_url, seller, mention):
+        """Classic-embed fallback, used only if a webhook rejects V2."""
         try:
             host = (urlparse(url).netloc or "Amazon").replace("www.", "")
         except Exception:
             host = "Amazon"
-
-        content = f"{mention} 🎯 **{_short(title, 120)}** @ {price or '—'}"
 
         embed = {
             "author": {"name": f"{host} Price Alert"},
@@ -115,7 +219,8 @@ class DiscordNotifier:
             "color": TARGET_ALERT_COLOR,
             "description": f"🎯 **{price or '—'}** · `{asin}`",
             "fields": [
-                {"name": "Reason", "value": reason or "Target Price Reached", "inline": True},
+                {"name": "Reason", "value": reason or "Target Price Reached",
+                 "inline": True},
             ],
         }
         if seller:
@@ -125,30 +230,23 @@ class DiscordNotifier:
         if image_url:
             embed["thumbnail"] = {"url": image_url}
 
+        row = [
+            {"type": 2, "style": 5, "label": f"ATC {q}",
+             "emoji": {"name": "🛒"}, "url": _atc_url(asin, q)}
+            for q in ATC_QUANTITIES
+        ]
+        if url:
+            row.append({"type": 2, "style": 5, "label": "Listing",
+                        "emoji": {"name": "📄"}, "url": url})
+
         payload = {
-            "content": content,
+            "content": f"{mention} 🎯 **{_short(title, 120)}** @ {price or '—'}",
             "embeds": [embed],
-            "components": [
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2,
-                            "style": 5,
-                            "label": "Product page",
-                            "emoji": {"name": "📓"},
-                            "url": url,
-                        }
-                    ],
-                }
-            ],
+            "components": [{"type": 1, "components": row[:5]}],
         }
-        # Whitelist ONLY the notify role so the <@&ID> in content actually
-        # pings it (works even if the role isn't "mentionable"), while
-        # suppressing any accidental @everyone/@here/user pings.
         if PING_ROLE_ID:
             payload["allowed_mentions"] = {"roles": [PING_ROLE_ID]}
-        return await self._post(session, payload, "target alert")
+        return payload
 
     # ------------------------------------------------------------------
     # Stock-list digest (no ping)
