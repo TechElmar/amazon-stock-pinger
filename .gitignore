@@ -7,6 +7,9 @@ amazon_monitor_pro.db-shm
 # Proxy credentials
 proxies.txt
 
+# Any local secrets file
+.env
+
 # Personal product list — your tracked ASINs
 watchlist.txt
 
