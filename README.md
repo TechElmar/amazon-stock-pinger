@@ -1,4 +1,4 @@
-# Amazon Stock Pinger
+# Amazon Stock Pinger - PokeDropz
 
 Fast Amazon stock + price monitor that fires Discord webhooks on real
 stock events: first in-stock detection, confirmed restocks, and price
