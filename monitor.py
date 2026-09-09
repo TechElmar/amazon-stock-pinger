@@ -1026,6 +1026,11 @@ class MonitorWorker(QThread):
         self._wishlist_burst_until: float = 0.0
 
         # Shared refs set in run_async.
+        # Optional Discord bot. It is an ADDITIONAL delivery target that
+        # posts only to AMP_ALERT_CHANNEL_ID; the webhooks below keep
+        # firing to their own destinations untouched either way. Stays
+        # None without AMP_BOT_TOKEN.
+        self.bot = None
         self.notifier: Optional["DiscordNotifier"] = None
         self.secondary_notifier: Optional["DiscordNotifier"] = (
             DiscordNotifier(DISCORD_SECONDARY_WEBHOOK)
@@ -1385,7 +1390,7 @@ class MonitorWorker(QThread):
             "image_url": result.get("image_url", ""),
             "seller": seller,
         }
-        for n in (self.notifier, self.secondary_notifier):
+        for n in (self.notifier, self.secondary_notifier, self.bot):
             if n is None:
                 continue
             self._spawn_send(
@@ -2402,7 +2407,7 @@ class MonitorWorker(QThread):
             prev_prices = {}
 
         if self.discord_session is not None:
-            for n in (self.notifier, self.secondary_notifier):
+            for n in (self.notifier, self.secondary_notifier, self.bot):
                 if n is None:
                     continue
                 self._spawn_send(
@@ -2655,6 +2660,27 @@ class MonitorWorker(QThread):
             self.checker = checker
             self.notifier = notifier
 
+            # Optional bot, purely additive. Any failure here is swallowed
+            # so webhook delivery is never affected by it.
+            try:
+                from bot import StockPingerBot, DISCORD_AVAILABLE, BOT_TOKEN
+                if BOT_TOKEN and not DISCORD_AVAILABLE:
+                    self.log.emit(
+                        "🤖 AMP_BOT_TOKEN set but discord.py is missing. "
+                        "Run: venv/bin/pip install -U discord.py"
+                    )
+                elif BOT_TOKEN:
+                    self.bot = StockPingerBot(self.db, worker=self, log=self.log)
+                    self.log.emit(
+                        "🤖 Bot token found, connecting. Webhooks continue "
+                        "unchanged regardless of how this goes."
+                    )
+                else:
+                    self.log.emit("🤖 No AMP_BOT_TOKEN, webhook-only mode.")
+            except Exception as e:
+                self.bot = None
+                self.log.emit(f"🤖 Bot init failed, webhooks unaffected: {e}")
+
             async with aiohttp.ClientSession() as discord_session:
                 self.discord_session = discord_session
 
@@ -2713,6 +2739,9 @@ class MonitorWorker(QThread):
                             "Add a public wishlist ID for sub-second restock detection."
                         )
 
+                    if self.bot is not None and self.bot.enabled:
+                        tasks.append(asyncio.create_task(self.bot.start()))
+
                     tasks.append(asyncio.create_task(self.keepalive_loop(domain)))
                     tasks.append(asyncio.create_task(self.stats_logger()))
                     tasks.append(asyncio.create_task(self.cookie_reset_loop()))
@@ -2726,6 +2755,13 @@ class MonitorWorker(QThread):
                         while self.running:
                             await asyncio.sleep(0.25)
                     finally:
+                        # Close the gateway cleanly rather than having it
+                        # cancelled mid-frame.
+                        if self.bot is not None:
+                            try:
+                                await self.bot.close()
+                            except Exception:
+                                pass
                         for t in tasks:
                             if not t.done():
                                 t.cancel()
