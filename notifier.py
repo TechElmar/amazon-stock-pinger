@@ -92,6 +92,9 @@ class DiscordNotifier:
 
     def __init__(self, webhook_url):
         self.webhook_url = (webhook_url or "").strip()
+        # None = untested, True = components v2 works, False = this
+        # webhook strips components (plain incoming webhook).
+        self._supports_components = None
 
     async def _post_raw(self, session: aiohttp.ClientSession, payload: dict):
         """POST and return (status, body_text). status None on network
@@ -140,26 +143,32 @@ class DiscordNotifier:
         if not self.webhook_url:
             return False, "Webhook is empty."
 
-        # Components V2 first — same layout the bot renders, so servers
-        # reached only by webhook get the identical modern look (heading,
-        # thumbnailed section, separators, ATC + Listing button rows).
-        payload = self._alert_v2_payload(
-            title=title, asin=asin, price=price, reason=reason,
-            url=url, image_url=image_url, seller=seller,
-        )
-        status, body = await self._post_raw(session, payload)
-        if status in (200, 204):
-            return True, "Discord target alert sent."
-        if status != 400:
-            return False, f"Discord target alert failed: {status} {str(body)[:150]}"
+        # Components V2 gives the nicest layout, but PLAIN incoming
+        # webhooks cannot carry components at all: Discord strips them
+        # and then rejects the message as empty (50006). Only an
+        # application-owned webhook or a bot can send them. So try V2
+        # once, remember the answer, and never pay for that round trip
+        # again on a webhook that cannot do it.
+        if self._supports_components is not False:
+            payload = self._alert_v2_payload(
+                title=title, asin=asin, price=price, reason=reason,
+                url=url, image_url=image_url, seller=seller,
+            )
+            status, body = await self._post_raw(session, payload)
+            if status in (200, 204):
+                self._supports_components = True
+                return True, "Discord target alert sent (components v2)."
+            if status != 400:
+                return False, (
+                    f"Discord target alert failed: {status} {str(body)[:150]}"
+                )
+            self._supports_components = False
 
-        # 400 → this webhook rejected the V2 layout; fall back to embeds
-        # so an alert NEVER goes undelivered over a formatting problem.
         fb = self._alert_embed_payload(
             title=title, asin=asin, price=price, reason=reason,
             url=url, image_url=image_url, seller=seller, mention=mention,
         )
-        return await self._post(session, fb, "target alert (embed fallback)")
+        return await self._post(session, fb, "target alert")
 
     def _alert_v2_payload(self, *, title, asin, price, reason, url,
                           image_url, seller):
@@ -227,44 +236,47 @@ class DiscordNotifier:
 
     def _alert_embed_payload(self, *, title, asin, price, reason, url,
                              image_url, seller, mention):
-        """Classic-embed fallback, used only if a webhook rejects V2."""
+        """Embed alert. This is the LIVE path for plain incoming
+        webhooks, which cannot render components, so it has to carry the
+        full design on its own: heading, spaced detail lines, thumbnail,
+        credit footer, and markdown add-to-cart links."""
         try:
             host = (urlparse(url).netloc or "Amazon").replace("www.", "")
         except Exception:
             host = "Amazon"
 
-        embed = {
-            "author": {"name": f"{host} Price Alert"},
-            "title": _short(title, 200) or "Amazon Product",
-            "url": url,
-            "color": TARGET_ALERT_COLOR,
-            "description": f"🎯 **{price or '—'}** · `{asin}`",
-            "fields": [
-                {"name": "Reason", "value": reason or "Target Price Reached",
-                 "inline": True},
-            ],
-        }
+        # Plain incoming webhooks strip message components, so the
+        # quantity shortcuts ship as bold markdown links instead of
+        # buttons. Same one click behaviour, no button chrome.
+        actions = "  ·  ".join(
+            f"[**ATC {q}**]({_atc_url(asin, q)})" for q in ATC_QUANTITIES
+        )
+        body = [
+            f"🎯 **{price or '—'}**  ·  `{asin}`",
+            "",
+            f"**Event:** {reason or 'Target Price Reached'}",
+            "**Reason:** Item is in stock at or below target",
+        ]
         if seller:
-            embed["fields"].append(
-                {"name": "Seller", "value": seller, "inline": True}
-            )
+            body.append(f"**Seller:** {seller}")
+        body += ["", f"🛒 {actions}"]
+        if url:
+            body.append(f"📄 [**View Listing**]({url})")
+
+        embed = {
+            "author": {"name": f"{host} Restock Alert"},
+            "title": _short(title, 200) or "Amazon Product",
+            "url": url or None,
+            "color": TARGET_ALERT_COLOR,
+            "description": "\n".join(body),
+            "footer": {"text": CREDIT},
+        }
         if image_url:
             embed["thumbnail"] = {"url": image_url}
-        embed["footer"] = {"text": CREDIT}
-
-        row = [
-            {"type": 2, "style": 5, "label": f"ATC {q}",
-             "emoji": {"name": "🛒"}, "url": _atc_url(asin, q)}
-            for q in ATC_QUANTITIES
-        ]
-        if url:
-            row.append({"type": 2, "style": 5, "label": "Listing",
-                        "emoji": {"name": "📄"}, "url": url})
 
         payload = {
             "content": f"{mention} 🎯 **{_short(title, 120)}** @ {price or '—'}",
             "embeds": [embed],
-            "components": [{"type": 1, "components": row[:5]}],
         }
         if PING_ROLE_ID:
             payload["allowed_mentions"] = {"roles": [PING_ROLE_ID]}
@@ -385,18 +397,30 @@ class DiscordNotifier:
         n = len(chunks)
 
         for k, chunk in enumerate(chunks, 1):
-            payload = self._digest_v2_payload(chunk, k, n, len(items), prev_prices)
-            status, body = await self._post_raw(session, payload)
-            if status in (200, 204):
-                continue
-            if status == 400:
-                # Webhook rejected the V2 layout — retry as embeds.
-                fb = self._digest_embed_payload(chunk, k, n, len(items), prev_prices)
-                status2, body2 = await self._post_raw(session, fb)
-                if status2 in (200, 204):
+            # Same capability memory as the alert path: a plain incoming
+            # webhook strips components, so once we have learned that,
+            # skip straight to embeds instead of burning a rejected
+            # round trip per chunk on every single digest.
+            if self._supports_components is not False:
+                payload = self._digest_v2_payload(
+                    chunk, k, n, len(items), prev_prices)
+                status, body = await self._post_raw(session, payload)
+                if status in (200, 204):
+                    self._supports_components = True
                     continue
-                return False, f"Discord digest failed: {status2} {str(body2)[:150]}"
-            return False, f"Discord digest failed: {status} {str(body)[:150]}"
+                if status != 400:
+                    return False, (
+                        f"Discord digest failed: {status} {str(body)[:150]}"
+                    )
+                self._supports_components = False
+
+            fb = self._digest_embed_payload(
+                chunk, k, n, len(items), prev_prices)
+            status2, body2 = await self._post_raw(session, fb)
+            if status2 not in (200, 204):
+                return False, (
+                    f"Discord digest failed: {status2} {str(body2)[:150]}"
+                )
 
         return True, (
             f"Discord stock list sent — {len(items)} item(s)"
