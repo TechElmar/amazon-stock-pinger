@@ -5,6 +5,13 @@ from typing import Tuple
 DB_PATH = Path("amazon_monitor_pro.db")
 WATCHLIST_PATH = Path("watchlist.txt")
 
+# Sentinel target for "ping at ANY price". Used for unreleased products
+# whose launch price is unknown: a target of 0 means digest-only and
+# would silently miss the first drop, which is the one that matters most.
+# High enough that any real Amazon price sits below it, so the normal
+# at-or-below-target path fires on the first confirmed in-stock read.
+ANY_PRICE_TARGET = 999999.0
+
 class Database:
     def __init__(self, path=DB_PATH):
         self.path = path
@@ -202,10 +209,19 @@ class Database:
                 continue
             target = 0.0
             if len(parts) >= 2:
-                try:
-                    target = float(parts[1].lstrip("$"))
-                except ValueError:
-                    target = 0.0
+                token = parts[1].strip().lstrip("$").upper()
+                if token in ("ANY", "*"):
+                    # Unreleased items have no sensible price target yet,
+                    # but "no target" means digest-only (never pings), so
+                    # the initial drop would be missed entirely. ANY sets
+                    # a sentinel ceiling: ping on the first Amazon-sold
+                    # in-stock read at whatever the launch price is.
+                    target = ANY_PRICE_TARGET
+                else:
+                    try:
+                        target = float(token)
+                    except ValueError:
+                        target = 0.0
             file_products[asin] = target
 
         existing = {p["asin"]: p for p in self.get_products()}
@@ -242,7 +258,10 @@ class Database:
         products = sorted(self.get_products(), key=lambda p: p["asin"])
         for p in products:
             target = float(p.get("target_price") or 0)
-            if target > 0:
+            if target >= ANY_PRICE_TARGET:
+                # Round-trip the sentinel as ANY, not as 999999.00.
+                lines.append(f"{p['asin']} ANY")
+            elif target > 0:
                 lines.append(f"{p['asin']} {target:.2f}")
             else:
                 lines.append(p["asin"])
