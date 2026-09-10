@@ -317,9 +317,17 @@ class StockPingerBot:
             view.add_item(ui.TextDisplay(ping))
         view.add_item(ui.TextDisplay("# 🎯 Amazon.ca Restock Alert"))
 
+        # Divider under the heading, so the alert reads as a header and
+        # then a product rather than one run-on block.
+        view.add_item(ui.Separator())
+
+        # What the item IS (title, price, code) is separated from the
+        # supporting detail by a blank line: the eye lands on the price
+        # first, which is the part that decides whether to click.
         body = (
             f"**{_short(title, 180) or 'Amazon Product'}**\n"
             f"🎯 **{price or '—'}** · `{asin}`\n"
+            f"\n"
             f"Event: {reason or 'Target Price Reached'}\n"
             f"Reason: Item is in stock at or below target"
         )
@@ -333,6 +341,10 @@ class StockPingerBot:
             ))
         else:
             view.add_item(ui.TextDisplay(body))
+
+        # Divider before the actions, so the buttons read as a distinct
+        # "do something" zone instead of crowding the detail lines.
+        view.add_item(ui.Separator())
 
         # Quick add-to-cart row (qty 1/2/3), then the listing.
         atc = ui.ActionRow()
