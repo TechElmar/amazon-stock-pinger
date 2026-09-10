@@ -1,4 +1,4 @@
-﻿"""Real Discord bot for Amazon Stock Pinger.
+"""Real Discord bot for Amazon Stock Pinger.
 
 Replaces the webhook "automated messenger" with an actual Discord
 application you own:
@@ -29,7 +29,7 @@ import asyncio
 import os
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 try:
     import discord
@@ -293,16 +293,29 @@ class StockPingerBot:
     # -- alert rendering ------------------------------------------------
 
     def _alert_layout(self, *, title, asin, price, reason, url,
-                      image_url, seller, role_id):
-        """Components V2 alert: role pill, heading, a section with the
-        product image as a side thumbnail, then quick add-to-cart rows."""
-        ui = discord.ui
-        c = ui.Container(accent_colour=discord.Colour(ALERT_COLOR))
+                      image_url, seller, role_id, mention=None):
+        """Flat Components V2 alert: mention, heading, thumbnailed
+        product section, add-to-cart rows.
 
-        if role_id:
-            c.add_item(ui.TextDisplay(f"<@&{role_id}>"))
-        c.add_item(ui.TextDisplay("# 🎯 Amazon.ca Restock Alert"))
-        c.add_item(ui.Separator())
+        Deliberately NOT wrapped in a Container. A Container draws the
+        bordered, accent-barred box around everything, which is the
+        embed-looking frame we are trying to get away from. Adding the
+        pieces straight to the view renders them as plain message
+        content: cleaner on desktop, and the text is real message text
+        so a phone notification can actually show what restocked
+        instead of a generic "sent a message".
+
+        `mention` overrides the usual role ping, so /preview can aim a
+        test ping at one person or role.
+        """
+        ui = discord.ui
+        view = ui.LayoutView(timeout=None)
+
+        ping = mention if mention is not None else (
+            f"<@&{role_id}>" if role_id else "")
+        if ping:
+            view.add_item(ui.TextDisplay(ping))
+        view.add_item(ui.TextDisplay("# 🎯 Amazon.ca Restock Alert"))
 
         body = (
             f"**{_short(title, 180) or 'Amazon Product'}**\n"
@@ -314,14 +327,12 @@ class StockPingerBot:
             body += f"\nSeller: {seller}"
 
         if image_url:
-            c.add_item(ui.Section(
+            view.add_item(ui.Section(
                 ui.TextDisplay(body),
                 accessory=ui.Thumbnail(media=image_url),
             ))
         else:
-            c.add_item(ui.TextDisplay(body))
-
-        c.add_item(ui.Separator())
+            view.add_item(ui.TextDisplay(body))
 
         # Quick add-to-cart row (qty 1/2/3), then the listing.
         atc = ui.ActionRow()
@@ -330,7 +341,7 @@ class StockPingerBot:
                 style=discord.ButtonStyle.link, label=f"ATC {q}",
                 url=_atc_url(asin, q), emoji="🛒",
             ))
-        c.add_item(atc)
+        view.add_item(atc)
 
         if url:
             row = ui.ActionRow()
@@ -338,16 +349,13 @@ class StockPingerBot:
                 style=discord.ButtonStyle.link, label="Listing",
                 url=url, emoji="📄",
             ))
-            c.add_item(row)
+            view.add_item(row)
 
         # Attribution, small and dim so it reads as a footer. '-# ' is
-        # Discord's subtext markdown. Shared with the webhook path so
-        # both transports credit identically.
-        c.add_item(ui.Separator())
-        c.add_item(ui.TextDisplay(f"-# {CREDIT}"))
+        # Discord's subtext markdown.
+        view.add_item(ui.Separator())
+        view.add_item(ui.TextDisplay(f"-# {CREDIT}"))
 
-        view = ui.LayoutView(timeout=None)
-        view.add_item(c)
         return view
 
     def _alert_embed_fallback(self, title, asin, price, reason, url,
@@ -607,6 +615,7 @@ class StockPingerBot:
         @app_commands.describe(
             kind="Which message to preview",
             asin="Optional: render with a real tracked product's live data",
+            ping="Optional: really ping this role or person as a live test",
         )
         @app_commands.choices(kind=[
             app_commands.Choice(name="Target alert", value="alert"),
@@ -615,7 +624,9 @@ class StockPingerBot:
         @app_commands.default_permissions(manage_guild=True)
         async def preview(inter: "discord.Interaction",
                           kind: "app_commands.Choice[str]",
-                          asin: Optional[str] = None):
+                          asin: Optional[str] = None,
+                          ping: Optional[
+                              "Union[discord.Role, discord.Member]"] = None):
             """Safe dry-run of the real renderers.
 
             Three guarantees, because this bot lives in a large server:
@@ -671,6 +682,7 @@ class StockPingerBot:
                         price=sample["price"], reason="Restock Alert",
                         url=sample["url"], image_url=sample["image_url"],
                         seller=sample["seller"], role_id=PING_ROLE_ID,
+                        mention=(ping.mention if ping else None),
                     ) if LAYOUT_V2 else None
                 else:
                     view = self._digest_layout(
@@ -681,19 +693,42 @@ class StockPingerBot:
                         "alerts fall back to classic embeds.", ephemeral=True)
                     return
 
-                # BOTH guards: invisible to others, and notifies nobody.
-                await inter.response.send_message(
-                    view=view, ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                if ping is None:
+                    # Silent preview: invisible to others, notifies nobody.
+                    await inter.response.send_message(
+                        view=view, ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    await inter.followup.send(
+                        f"☝️ Preview of the **{kind.name}** layout.\n"
+                        f"• Visible only to you (ephemeral)\n"
+                        f"• **0 notifications sent** — the mention renders "
+                        f"but pings nobody\n"
+                        f"• Nothing was written to the database\n"
+                        f"• Add `ping:` to send a real test ping",
+                        ephemeral=True,
+                    )
+                    return
+
+                # LIVE TEST PING. Posts publicly and really notifies the
+                # chosen target, because an ephemeral message cannot
+                # notify anyone but the person who ran the command.
+                is_role = isinstance(ping, discord.Role)
+                allowed = discord.AllowedMentions(
+                    everyone=False,
+                    roles=[ping] if is_role else False,
+                    users=False if is_role else [ping],
                 )
+                await inter.response.send_message(
+                    view=view, allowed_mentions=allowed)
                 await inter.followup.send(
-                    f"☝️ Preview of the **{kind.name}** layout.\n"
-                    f"• Visible only to you (ephemeral)\n"
-                    f"• **0 notifications sent** — the role pill renders "
-                    f"but pings nobody\n"
+                    f"✅ Test ping sent to **{ping}** "
+                    f"({'role' if is_role else 'user'}).\n"
+                    f"• This one was **public and really notified them**\n"
                     f"• Nothing was written to the database",
                     ephemeral=True,
                 )
+                self.log(f"🤖 /preview test ping -> {ping} by {inter.user}")
             except Exception as e:
                 # Never let a preview bug surface as a broken interaction.
                 msg = f"Preview failed to render: `{e}`"
