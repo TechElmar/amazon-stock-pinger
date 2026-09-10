@@ -2086,13 +2086,12 @@ class MonitorWorker(QThread):
                     self.log.emit(f"BURST MODE on {asin} for 30s (OOS → In Stock)")
                 last_stock_oos = obs_category == "oos"
 
-                # Stock-ping decision: when wishlist data is available
-                # the wishlist scanner is the canonical source — it
-                # already calls _maybe_announce per probe. Calling
-                # again from here would just double the hysteresis
-                # counter increments without adding signal. So we only
-                # announce from here for non-wishlist ASINs.
-                if not has_wishlist_data:
+                # Stock-ping decision: when the result came from the
+                # crawl, the wishlist scanner is the canonical source and
+                # already called _maybe_announce for it. Announcing again
+                # here would double the hysteresis counters without
+                # adding signal, so only our OWN fetches announce here.
+                if not used_wishlist:
                     self._maybe_announce(
                         product, result, source=f"dp/{proxy_source}"
                     )
