@@ -309,32 +309,33 @@ class StockPingerBot:
             f"<@&{role_id}>" if role_id else "")
         short_title = _short(title, 120) or "Amazon Product"
 
-        # Lead line carries the product and price so a truncated
-        # notification preview still says what restocked and for how much.
-        lines = [f"{ping} 🎯 **{short_title}** @ {price or '—'}".lstrip()]
-        lines.append("")
-        lines.append("# 🎯 Amazon.ca Restock Alert")
-        lines.append(RULE)
-        lines.append(f"**{_short(title, 180) or 'Amazon Product'}**")
-        lines.append(f"🎯 **{price or '—'}** · `{asin}`")
-        lines.append("")
-        lines.append(f"Event: {reason or 'Target Price Reached'}")
-        lines.append("Reason: Item is in stock at or below target")
-        if seller:
-            lines.append(f"Seller: {seller}")
-        lines.append(RULE)
-        lines.append(f"-# {CREDIT}")
-        content = "\n".join(lines)
+        # Content line exists purely so the phone notification says what
+        # restocked and for how much. Discord builds the push preview
+        # from content, and content is the ONE thing Components V2 is
+        # not allowed to have, which is why V2 pushed a useless
+        # "sent a message".
+        content = f"{ping} 🎯 **{short_title}** @ {price or '—'}".lstrip()
 
-        # The product shot rides in a bare embed carrying ONLY an image:
-        # no title, no description, and crucially no colour, so Discord
-        # draws no accent bar. That keeps the picture without rebuilding
-        # the boxed card around the text, and because the text lives in
-        # content the phone notification is unaffected.
-        embed = None
+        # Everything else lives in a single slim embed: it gives the
+        # right-hand thumbnail and the tidy framing, which plain text
+        # cannot do. A bot may send content, an embed and buttons in the
+        # same message, so nothing has to be traded away here.
+        embed = discord.Embed(
+            title=_short(title, 200) or "Amazon Product",
+            url=url or None,
+            colour=discord.Colour(ALERT_COLOR),
+            description=(
+                f"🎯 **{price or '—'}** · `{asin}`\n"
+                f"\n"
+                f"Event: {reason or 'Target Price Reached'}\n"
+                f"Reason: Item is in stock at or below target"
+                + (f"\nSeller: {seller}" if seller else "")
+            ),
+        )
+        embed.set_author(name="Amazon.ca Restock Alert")
         if image_url:
-            embed = discord.Embed()
-            embed.set_image(url=image_url)
+            embed.set_thumbnail(url=image_url)
+        embed.set_footer(text=CREDIT)
 
         view = discord.ui.View(timeout=None)
         for q in ATC_QUANTITIES:
