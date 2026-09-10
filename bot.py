@@ -74,6 +74,12 @@ LAYOUT_V2 = DISCORD_AVAILABLE and hasattr(discord.ui, "LayoutView")
 # carrying the affiliate tag through the purchase.
 ATC_QUANTITIES = (1, 2, 3)
 
+# Discord markdown has no horizontal rule, so a run of box-drawing
+# characters stands in for the Components V2 separators. Needed because
+# an alert has to live in plain message content for phone notifications
+# to show the product, and separators are a V2-only component.
+RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 
 def _short(text: str, limit: int = 150) -> str:
     text = (text or "").strip()
@@ -270,11 +276,12 @@ class StockPingerBot:
             allowed = discord.AllowedMentions.none()
 
         try:
-            content, view = self._alert_message(
+            content, embed, view = self._alert_message(
                 title=title, asin=asin, price=price, reason=reason,
-                url=url, seller=seller, role_id=PING_ROLE_ID,
+                url=url, seller=seller, image_url=image_url,
+                role_id=PING_ROLE_ID,
             )
-            await ch.send(content=content, view=view,
+            await ch.send(content=content, embed=embed, view=view,
                           allowed_mentions=allowed)
             return True, "Bot target alert sent."
         except Exception as e:
@@ -283,7 +290,7 @@ class StockPingerBot:
     # -- alert rendering ------------------------------------------------
 
     def _alert_message(self, *, title, asin, price, reason, url,
-                       seller, role_id, mention=None):
+                       seller, role_id, image_url="", mention=None):
         """Plain message text plus real buttons. Returns (content, view).
 
         NOT Components V2, on purpose. Discord builds the phone
@@ -307,6 +314,7 @@ class StockPingerBot:
         lines = [f"{ping} 🎯 **{short_title}** @ {price or '—'}".lstrip()]
         lines.append("")
         lines.append("# 🎯 Amazon.ca Restock Alert")
+        lines.append(RULE)
         lines.append(f"**{_short(title, 180) or 'Amazon Product'}**")
         lines.append(f"🎯 **{price or '—'}** · `{asin}`")
         lines.append("")
@@ -314,9 +322,19 @@ class StockPingerBot:
         lines.append("Reason: Item is in stock at or below target")
         if seller:
             lines.append(f"Seller: {seller}")
-        lines.append("")
+        lines.append(RULE)
         lines.append(f"-# {CREDIT}")
         content = "\n".join(lines)
+
+        # The product shot rides in a bare embed carrying ONLY an image:
+        # no title, no description, and crucially no colour, so Discord
+        # draws no accent bar. That keeps the picture without rebuilding
+        # the boxed card around the text, and because the text lives in
+        # content the phone notification is unaffected.
+        embed = None
+        if image_url:
+            embed = discord.Embed()
+            embed.set_image(url=image_url)
 
         view = discord.ui.View(timeout=None)
         for q in ATC_QUANTITIES:
@@ -329,7 +347,7 @@ class StockPingerBot:
                 style=discord.ButtonStyle.link, label="Listing",
                 url=url, emoji="📄", row=1,
             ))
-        return content, view
+        return content, embed, view
 
     def _alert_layout(self, *, title, asin, price, reason, url,
                       image_url, seller, role_id, mention=None):
@@ -727,12 +745,13 @@ class StockPingerBot:
 
             from notifier import PING_ROLE_ID
             try:
-                content = None
+                content = embed = None
                 if kind.value == "alert":
-                    content, view = self._alert_message(
+                    content, embed, view = self._alert_message(
                         title=sample["title"], asin=sample["asin"],
                         price=sample["price"], reason="Restock Alert",
                         url=sample["url"], seller=sample["seller"],
+                        image_url=sample["image_url"],
                         role_id=PING_ROLE_ID,
                         mention=(ping.mention if ping else None),
                     )
@@ -748,7 +767,8 @@ class StockPingerBot:
                 if ping is None:
                     # Silent preview: invisible to others, notifies nobody.
                     await inter.response.send_message(
-                        content=content, view=view, ephemeral=True,
+                        content=content, embed=embed, view=view,
+                        ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     await inter.followup.send(
@@ -772,7 +792,8 @@ class StockPingerBot:
                     users=False if is_role else [ping],
                 )
                 await inter.response.send_message(
-                    content=content, view=view, allowed_mentions=allowed)
+                    content=content, embed=embed, view=view,
+                    allowed_mentions=allowed)
                 await inter.followup.send(
                     f"✅ Test ping sent to **{ping}** "
                     f"({'role' if is_role else 'user'}).\n"
