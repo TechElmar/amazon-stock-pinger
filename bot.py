@@ -470,38 +470,63 @@ class StockPingerBot:
             return False, "No digest channel configured."
 
         prev_prices = prev_prices or {}
-        per = DIGEST_ITEMS_PER_PART if LAYOUT_V2 else DIGEST_ITEMS_PER_EMBED
+        # 9 products max per message: Discord allows 10 embeds and the
+        # first one is the header.
+        per = 9
         chunks = [
             items[i:i + per] for i in range(0, len(items), per)
         ] or [[]]
 
         try:
             for k, chunk in enumerate(chunks, 1):
-                if LAYOUT_V2:
-                    await ch.send(view=self._digest_layout(
-                        chunk, k, len(chunks), len(items), prev_prices))
-                else:
-                    embed = discord.Embed(
-                        title="📦 Amazon Stock Watchlist", color=DIGEST_COLOR,
-                        description=(
-                            f"{len(items)} purchasable item"
-                            f"{'s' if len(items) != 1 else ''}"
-                            + (f" · Part {k}/{len(chunks)}"
-                               if len(chunks) > 1 else "")
-                        ),
-                        timestamp=datetime.now().astimezone(),
-                    )
-                    for it in chunk:
-                        embed.add_field(
-                            name=_short(it.get("title", ""), 240) or it["asin"],
-                            value=self._price_line(it, prev_prices)
-                                  + f"\n[View on Amazon]({it['url']})",
-                            inline=False,
-                        )
-                    await ch.send(embed=embed)
+                content, embeds = self._digest_message(
+                    chunk, k, len(chunks), len(items), prev_prices)
+                await ch.send(content=content, embeds=embeds,
+                              allowed_mentions=discord.AllowedMentions.none())
             return True, f"Bot stock list sent — {len(items)} item(s)."
         except Exception as e:
             return False, f"Bot digest failed: {e}"
+
+    def _digest_message(self, chunk, k, n, total, prev_prices):
+        """Stock list in the same shape as an alert: a content line for
+        the notification, then slim embeds carrying the thumbnails.
+
+        One embed per product, because a thumbnail belongs to an embed
+        and a single embed can only hold one. Titles are the links, so
+        the list stays readable instead of growing a wall of buttons.
+        Deliberately never mentions anyone: this is informational.
+        """
+        content = (
+            f"📦 **Amazon Stock Watchlist** — {total} item"
+            f"{'s' if total != 1 else ''} in stock"
+            + (f" · Part {k}/{n}" if n > 1 else "")
+        )
+
+        header = discord.Embed(
+            title="📦 Amazon Stock Watchlist",
+            colour=discord.Colour(DIGEST_COLOR),
+            description=(
+                f"Updated: {datetime.now().strftime('%B %d, %Y')}\n"
+                f"{total} purchasable item{'s' if total != 1 else ''}"
+                + (f" · Part {k}/{n}" if n > 1 else "")
+            ),
+        )
+        embeds = [header]
+
+        for it in chunk:
+            e = discord.Embed(
+                title=_short(it.get("title", ""), 200) or it["asin"],
+                url=it.get("url") or None,
+                colour=discord.Colour(DIGEST_COLOR),
+                description=self._price_line(it, prev_prices),
+            )
+            if it.get("image_url"):
+                e.set_thumbnail(url=it["image_url"])
+            embeds.append(e)
+
+        # One credit for the whole list, on the last embed.
+        embeds[-1].set_footer(text=CREDIT)
+        return content, embeds
 
     def _digest_layout(self, chunk, k, n, total, prev_prices):
         """Components V2 stock list: heading, then one thumbnailed
