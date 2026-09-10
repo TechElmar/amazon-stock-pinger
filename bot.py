@@ -270,27 +270,66 @@ class StockPingerBot:
             allowed = discord.AllowedMentions.none()
 
         try:
-            if LAYOUT_V2:
-                view = self._alert_layout(
-                    title=title, asin=asin, price=price, reason=reason,
-                    url=url, image_url=image_url, seller=seller,
-                    role_id=PING_ROLE_ID,
-                )
-                # A LayoutView carries the whole message — Discord rejects
-                # content/embeds alongside the Components V2 flag.
-                await ch.send(view=view, allowed_mentions=allowed)
-            else:
-                content, embed, view = self._alert_embed_fallback(
-                    title, asin, price, reason, url, image_url, seller,
-                    PING_ROLE_ID,
-                )
-                await ch.send(content=content or None, embed=embed,
-                              view=view, allowed_mentions=allowed)
+            content, view = self._alert_message(
+                title=title, asin=asin, price=price, reason=reason,
+                url=url, seller=seller, role_id=PING_ROLE_ID,
+            )
+            await ch.send(content=content, view=view,
+                          allowed_mentions=allowed)
             return True, "Bot target alert sent."
         except Exception as e:
             return False, f"Bot target alert failed: {e}"
 
     # -- alert rendering ------------------------------------------------
+
+    def _alert_message(self, *, title, asin, price, reason, url,
+                       seller, role_id, mention=None):
+        """Plain message text plus real buttons. Returns (content, view).
+
+        NOT Components V2, on purpose. Discord builds the phone
+        notification from a message's `content`, and the V2 API forbids
+        `content` entirely, so a V2 alert can only ever push a useless
+        "Bot sent a message". Everything here is ordinary message text,
+        so the notification names the product and the price, which is
+        the whole point of getting pinged.
+
+        Buttons still work because a bot (unlike a plain webhook) may
+        attach action rows to a normal message. The cost is the side
+        thumbnail: an image needs either V2 or an embed, and an embed
+        brings back the boxed frame. Text beats picture on a phone.
+        """
+        ping = mention if mention is not None else (
+            f"<@&{role_id}>" if role_id else "")
+        short_title = _short(title, 120) or "Amazon Product"
+
+        # Lead line carries the product and price so a truncated
+        # notification preview still says what restocked and for how much.
+        lines = [f"{ping} 🎯 **{short_title}** @ {price or '—'}".lstrip()]
+        lines.append("")
+        lines.append("# 🎯 Amazon.ca Restock Alert")
+        lines.append(f"**{_short(title, 180) or 'Amazon Product'}**")
+        lines.append(f"🎯 **{price or '—'}** · `{asin}`")
+        lines.append("")
+        lines.append(f"Event: {reason or 'Target Price Reached'}")
+        lines.append("Reason: Item is in stock at or below target")
+        if seller:
+            lines.append(f"Seller: {seller}")
+        lines.append("")
+        lines.append(f"-# {CREDIT}")
+        content = "\n".join(lines)
+
+        view = discord.ui.View(timeout=None)
+        for q in ATC_QUANTITIES:
+            view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link, label=f"ATC {q}",
+                url=_atc_url(asin, q), emoji="🛒", row=0,
+            ))
+        if url:
+            view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link, label="Listing",
+                url=url, emoji="📄", row=1,
+            ))
+        return content, view
 
     def _alert_layout(self, *, title, asin, price, reason, url,
                       image_url, seller, role_id, mention=None):
@@ -688,14 +727,15 @@ class StockPingerBot:
 
             from notifier import PING_ROLE_ID
             try:
+                content = None
                 if kind.value == "alert":
-                    view = self._alert_layout(
+                    content, view = self._alert_message(
                         title=sample["title"], asin=sample["asin"],
                         price=sample["price"], reason="Restock Alert",
-                        url=sample["url"], image_url=sample["image_url"],
-                        seller=sample["seller"], role_id=PING_ROLE_ID,
+                        url=sample["url"], seller=sample["seller"],
+                        role_id=PING_ROLE_ID,
                         mention=(ping.mention if ping else None),
-                    ) if LAYOUT_V2 else None
+                    )
                 else:
                     view = self._digest_layout(
                         [sample], 1, 1, 1, {}) if LAYOUT_V2 else None
@@ -708,7 +748,7 @@ class StockPingerBot:
                 if ping is None:
                     # Silent preview: invisible to others, notifies nobody.
                     await inter.response.send_message(
-                        view=view, ephemeral=True,
+                        content=content, view=view, ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     await inter.followup.send(
@@ -732,7 +772,7 @@ class StockPingerBot:
                     users=False if is_role else [ping],
                 )
                 await inter.response.send_message(
-                    view=view, allowed_mentions=allowed)
+                    content=content, view=view, allowed_mentions=allowed)
                 await inter.followup.send(
                     f"✅ Test ping sent to **{ping}** "
                     f"({'role' if is_role else 'user'}).\n"
