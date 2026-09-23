@@ -339,6 +339,21 @@ DP_MAX_PER_SECOND = 4.0
 # is a soft block, not an ambiguous page, and must be treated as a
 # failure so the item falls back to crawl data instead of hammering.
 SHELL_PAGE_MAX_BYTES = 600 * 1024
+
+# SELLER CACHE WARMING.
+#
+# The ping gate needs a confirmed Amazon seller, and resolving that at
+# drop time is the worst moment to try: /dp/ is most degraded exactly
+# when a drop is happening. Warming the cache in the quiet periods means
+# the answer is already there when it matters.
+#
+# Sized to be invisible: one verification every few seconds, a handful
+# per pass. That is background work and must never compete with a live
+# drop for the /dp/ budget.
+SELLER_WARM_INTERVAL = 20.0          # seconds between passes
+SELLER_WARM_BATCH = 4                # verifications per pass
+SELLER_WARM_SPACING = 3.0            # seconds between them
+SELLER_WARM_REFRESH_SECONDS = 6 * 60 * 60   # re-check a known seller
 # How often to emit the coverage log line (the crawl runs many cycles
 # per second; we don't want a log line every cycle).
 WISHLIST_CRAWL_LOG_SECONDS = 30
@@ -1623,6 +1638,10 @@ class MonitorWorker(QThread):
         self._oos_cause: Dict[str, str] = {}
         self._oos_was_real: Dict[str, bool] = {}
         self._floor_logged: set = set()
+        # (asin, seller_class) pairs already reported as gate-held, so a
+        # held item says so once per state rather than every scan.
+        self._gate_logged: set = set()
+        self._warm_log_at: float = 0.0
         self.effective_state: Dict[str, Optional[str]] = {}
 
         # Per-ASIN epoch timestamp marking when the current confirmed-OOS
@@ -2288,6 +2307,74 @@ class MonitorWorker(QThread):
         finally:
             self._confirming.discard(asin)
 
+    async def seller_warmer_forever(self) -> None:
+        """Resolve sellers BEFORE a drop, not during one.
+
+        The gate needs a confirmed Amazon seller. Resolving that at drop
+        time is the worst possible moment: /dp/ is most degraded exactly
+        when everyone is hammering Amazon, and every second counts.
+
+        Measured 2026-09-23: only 21 of 43 tracked products had ever had
+        a seller resolved, so the other 22 could not ping at all no
+        matter how in stock they were. Two confirmed drops were lost to
+        this.
+
+        Sellers change rarely, and there is spare /dp/ budget when
+        nothing is dropping, so walk the watchlist continuously and keep
+        the cache warm. Deliberately slow: this is background work and
+        must never compete with a live drop.
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(SELLER_WARM_INTERVAL)
+                if self.checker is None or self.scan_session is None:
+                    continue
+
+                products = self._enabled_products() or {}
+                now = time.time()
+                stale = []
+                for asin in products:
+                    entry = self.seller_cache.get(asin)
+                    if not entry:
+                        stale.append((0.0, asin))      # never resolved: first
+                        continue
+                    if entry.get("class") in ("amazon", "third_party"):
+                        age = now - entry.get("ts", 0.0)
+                        if age >= SELLER_WARM_REFRESH_SECONDS:
+                            stale.append((now - age, asin))
+                    else:
+                        stale.append((entry.get("ts", 0.0), asin))
+
+                if not stale:
+                    continue
+                # Oldest (and never-resolved) first.
+                stale.sort()
+                for _ts, asin in stale[:SELLER_WARM_BATCH]:
+                    if not self.running:
+                        break
+                    if asin in self._verifying:
+                        continue
+                    self._request_seller_verification(asin)
+                    await asyncio.sleep(SELLER_WARM_SPACING)
+
+                unresolved = sum(
+                    1 for a in products
+                    if (self.seller_cache.get(a) or {}).get("class")
+                    not in ("amazon", "third_party")
+                )
+                if unresolved and (
+                    time.monotonic() - self._warm_log_at >= 300
+                ):
+                    self._warm_log_at = time.monotonic()
+                    self.log.emit(
+                        f"🌡️ seller cache: {len(products) - unresolved}"
+                        f"/{len(products)} resolved, warming {unresolved}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log.emit(f"Seller warmer error: {e}")
+
     def _note_seller_verify_failed(self, asin: str, prev_entry: dict) -> None:
         """Record that a seller read failed WITHOUT destroying what we
         already knew.
@@ -2507,6 +2594,39 @@ class MonitorWorker(QThread):
         digest-only items too.
         """
         observation = self._categorize(asin, result)
+
+        # THE SILENT GATE.
+        #
+        # An item can be in stock at a real price and still never ping,
+        # because the seller could not be confirmed as Amazon. That state
+        # used to log NOTHING, so it ran for days unnoticed:
+        # B0H7FDBNSB sat in stock at $16.99 for 191 logged sightings and
+        # B0H77W4411 at $27.99 for 671, neither ever announced, with no
+        # trace explaining why. Anything the gate refuses while the item
+        # looks announceable has to say so out loud.
+        if observation != "in_stock":
+            pn = result.get("price_number")
+            looks_live = (
+                pn is not None
+                and "in stock" in (result.get("stock") or "").lower()
+                and target and target > 0 and pn <= target
+            )
+            if looks_live:
+                sclass = (self.seller_cache.get(asin) or {}).get(
+                    "class", "unresolved")
+                key = (asin, sclass)
+                if key not in self._gate_logged:
+                    self._gate_logged.add(key)
+                    self.log.emit(
+                        f"🚧 {asin} IS IN STOCK at {result.get('price')} "
+                        f"(target ${target:.2f}) but the gate is holding it: "
+                        f"seller is {sclass!r}. No ping until that resolves."
+                    )
+            else:
+                self._gate_logged = {
+                    k for k in self._gate_logged if k[0] != asin
+                }
+
         prev_eff, new_eff, ended_oos_secs = self._observe(asin, observation)
 
         # Remember the freshest confirmed-Amazon in-stock read — the
@@ -3940,6 +4060,7 @@ class MonitorWorker(QThread):
 
                     tasks.append(asyncio.create_task(self.keepalive_loop(domain)))
                     tasks.append(asyncio.create_task(self.stats_logger()))
+                    tasks.append(asyncio.create_task(self.seller_warmer_forever()))
                     tasks.append(asyncio.create_task(self.cookie_reset_loop()))
                     tasks.append(asyncio.create_task(self.daily_digest_loop()))
                     if PROFILE_ROTATION_ENABLED:
