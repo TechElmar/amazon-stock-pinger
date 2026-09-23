@@ -286,13 +286,67 @@ ROTATING_PROXY_FILE = "proxies_rotating.txt"
 # cleanest place to read a block rate. Flip the monitor flag only once
 # the confirm numbers look good.
 ROTATING_FOR_CONFIRM = True
-ROTATING_FOR_MONITOR = False
+ROTATING_FOR_MONITOR = True
+
+# CONCURRENCY CAP ON THE ROTATING GATEWAY.
+#
+# The plan is billed by THREADS, not requests: 100 concurrent
+# connections. Every rotating request opens its own connection (that is
+# what makes it rotate), and the bot runs 43 independent product loops
+# plus a 5-page crawl, all firing at once. Unthrottled, that sails past
+# 100, the gateway refuses the excess, and the bot records the refusals
+# as blocks.
+#
+# Measured live on 2026-09-19: flipping monitoring to the gateway with
+# no cap took the block rate from ~20% to ~90% and starved products out
+# to 246s behind, while the gateway itself stayed perfectly healthy
+# (8/8 on a sequential probe immediately after). The volume was never
+# the problem; the burst shape was.
+#
+# Steady state actually needs ~6 req/s at ~2s each, so roughly 12-15
+# connections. 60 leaves room for bursts and still sits well under the
+# cap. Requests above it wait a moment instead of being refused.
+ROTATING_MAX_CONCURRENT = 60
+
+# Timeout for rotating-gateway requests.
+#
+# HTTP_TIMEOUT_SECONDS is 3, which suits a WARM connection on the static
+# pool. Every rotating request opens a NEW connection, so it pays a TLS
+# handshake and lands around 2.8s median, 5.5s p95. Against a 3s limit
+# that timed out 18% of perfectly good fetches. This is not slowness to
+# fix, it is the cost of a fresh exit IP, so the timeout has to allow
+# for it.
+ROTATING_TIMEOUT_SECONDS = 12
 # How often to emit the coverage log line (the crawl runs many cycles
 # per second; we don't want a log line every cycle).
 WISHLIST_CRAWL_LOG_SECONDS = 30
 
 # Extracts the "show more" pagination URL from a wishlist page/fragment.
 _SHOW_MORE_RE = re.compile(r'"showMoreUrl"\s*:\s*"([^"]+)"')
+
+
+# Page furniture that must never be mistaken for a product name.
+#
+# On 2026-09-18 Amazon moved the wishlist product name into a title
+# attribute and left "Quick View" as the anchor's visible text. The
+# parser took the text, so 16,971 readings came back named "Quick View"
+# and a ping went out to the server with that as the product. This set
+# is the backstop: whatever the markup does next, a known UI string can
+# never become a title.
+_UI_CHROME_TITLES = {
+    "quick view", "add to cart", "add to list", "see all buying options",
+    "buy it again", "delete", "move", "share", "compare", "edit",
+    "view listing", "shop now", "learn more", "sign in", "more options",
+    "see options", "select options", "view", "buy now", "details",
+}
+
+
+def is_real_title(value: str) -> bool:
+    """True when this looks like an actual product name."""
+    v = (value or "").strip()
+    if len(v) < 5:
+        return False
+    return v.lower().strip(" .") not in _UI_CHROME_TITLES
 
 
 def extract_show_more_url(html: str) -> str:
@@ -867,26 +921,47 @@ class HTTPAmazonChecker:
         session,
         asin: str,
         proxy: Optional[str],
+        minimal_headers: bool = False,
     ) -> Dict[str, Any]:
         url = self.product_url(asin)
         proxy_label = proxy_label_from_url(proxy)
 
-        # Range header — we only need the first ~150KB of HTML: the
-        # buy box (price, buttons, AND the Sold-by merchant info) all
-        # live in that window. Still cuts bandwidth ~5x vs full page.
-        # Referer pretends user clicked through from search results,
-        # which Amazon's WAF scrutinizes less than direct URL hits.
-        headers = {
-            "Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8",
-            "Cache-Control": "no-cache",
-            "Referer": f"{self.amazon_domain}/s?k={asin}",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
-            "Upgrade-Insecure-Requests": "1",
-            "Range": "bytes=0-150000",
-        }
+        if minimal_headers:
+            # LESS IS MORE ON IPv6.
+            #
+            # curl_cffi already impersonates Chrome 146 and emits that
+            # browser's own header set. Layering the hand-written block
+            # below on top produces a combination no real Chrome sends.
+            # On the static IPv4 pool Amazon tolerates it; through the
+            # rotating IPv6 gateway, which starts from lower trust, it is
+            # an instant block.
+            #
+            # Measured interleaved at load, so both arms saw identical
+            # conditions:
+            #     full header set     97% blocked
+            #     full minus Range    95% blocked
+            #     accept-language only 0% blocked
+            # Every header added ALONE was also 0%, so it is the
+            # combination that gives the game away, not any one header.
+            headers = {"Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8"}
+        else:
+            # Range header — we only need the first ~150KB of HTML: the
+            # buy box (price, buttons, AND the Sold-by merchant info) all
+            # live in that window. Amazon ignores it in practice (see
+            # parse_html) but it costs nothing to ask.
+            # Referer pretends user clicked through from search results,
+            # which Amazon's WAF scrutinizes less than direct URL hits.
+            headers = {
+                "Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8",
+                "Cache-Control": "no-cache",
+                "Referer": f"{self.amazon_domain}/s?k={asin}",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-User": "?1",
+                "Sec-Fetch-Dest": "document",
+                "Upgrade-Insecure-Requests": "1",
+                "Range": "bytes=0-150000",
+            }
 
         async with self.semaphore:
             try:
@@ -894,7 +969,8 @@ class HTTPAmazonChecker:
                     url,
                     headers=headers,
                     proxy=proxy,
-                    timeout=HTTP_TIMEOUT_SECONDS,
+                    timeout=(ROTATING_TIMEOUT_SECONDS if minimal_headers
+                             else HTTP_TIMEOUT_SECONDS),
                     allow_redirects=True,
                 )
 
@@ -1094,7 +1170,14 @@ class WishlistScanner:
         self.wishlist_id = (wishlist_id or "").strip()
 
     def wishlist_url(self) -> str:
-        return f"{self.amazon_domain}/hz/wishlist/ls/{self.wishlist_id}"
+        # viewType=list is NOT cosmetic. In grid view Amazon renders each
+        # item as an image tile whose only link text is "Quick View", with
+        # the product name pushed into a title attribute. That is exactly
+        # what put "Quick View" into a live ping. List view renders the
+        # real product name as the link text, which is both what we want
+        # to read and what the parser was originally written against.
+        return (f"{self.amazon_domain}/hz/wishlist/ls/{self.wishlist_id}"
+                f"?viewType=list")
 
     def parse_wishlist(self, html: str) -> Dict[str, Dict[str, Any]]:
         results: Dict[str, Dict[str, Any]] = {}
@@ -1141,18 +1224,33 @@ class WishlistScanner:
             if img_el:
                 image_url = img_el.get("src", "") or img_el.get("data-src", "")
 
+            # TITLE.
+            #
+            # Amazon changed this markup: the item anchor lost its
+            # id="itemName_...", its visible text became "Quick View",
+            # and the real product name moved into the title ATTRIBUTE.
+            # The old code read get_text() first, so every item started
+            # reporting "Quick View" as its name and pings went out
+            # saying that. So: prefer the attribute, and never accept a
+            # value that is known page furniture.
             title = ""
             for sel in (
                 'a[id*="itemName"]',
-                'h2 a',
+                "h2 a",
+                "a[title]",
                 'a[href*="/dp/"]',
                 ".a-link-normal[title]",
             ):
-                title_el = el.select_one(sel)
-                if title_el:
-                    title = clean(title_el.get_text(" ")) or title_el.get("title", "")
+                for cand in el.select(sel):
+                    for value in (clean(cand.get("title", "")),
+                                  clean(cand.get_text(" "))):
+                        if is_real_title(value):
+                            title = value
+                            break
                     if title:
                         break
+                if title:
+                    break
 
             price = ""
             for sel in (
@@ -1340,6 +1438,12 @@ class MonitorWorker(QThread):
         # it so the cooldown can leave them alone.
         self.rotating_proxies: List[str] = []
         self._rotating_labels: set = set()
+        # Concurrency cap on the gateway, created lazily because a
+        # Semaphore must be bound to the running event loop.
+        self._rotating_sem: Optional[asyncio.Semaphore] = None
+        self._rot_inflight: int = 0
+        self._rot_peak: int = 0
+        self._rot_waited: int = 0
         # Burst-confirm deadline (monotonic). While now < this, the
         # wishlist crawler runs at WISHLIST_BURST_SLEEP cadence to race
         # the confirming read of a targeted item that just went in stock.
@@ -1942,18 +2046,26 @@ class MonitorWorker(QThread):
         a TLS handshake (~1.5s vs ~2.1s), so it keeps the shared session.
         """
         if self._is_rotating(proxy):
-            session = AsyncSession(
-                impersonate=STATIC_IMPERSONATE_PROFILE,
-                max_clients=1,
-            )
-            await session.__aenter__()
-            try:
-                yield session
-            finally:
+            if self._rotating_sem is None:
+                self._rotating_sem = asyncio.Semaphore(ROTATING_MAX_CONCURRENT)
+            if self._rotating_sem.locked():
+                self._rot_waited += 1
+            async with self._rotating_sem:
+                self._rot_inflight += 1
+                self._rot_peak = max(self._rot_peak, self._rot_inflight)
+                session = AsyncSession(
+                    impersonate=STATIC_IMPERSONATE_PROFILE,
+                    max_clients=1,
+                )
+                await session.__aenter__()
                 try:
-                    await session.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                    yield session
+                finally:
+                    self._rot_inflight -= 1
+                    try:
+                        await session.__aexit__(None, None, None)
+                    except Exception:
+                        pass
         else:
             yield self.scan_session
 
@@ -1982,7 +2094,9 @@ class MonitorWorker(QThread):
         raw: List[Dict[str, Any]] = []
         for _attempt in range(2):
             async with self._session_for(proxy) as session:
-                r = await checker.fetch_product(session, asin, proxy)
+                r = await checker.fetch_product(
+                    session, asin, proxy, minimal_headers=True
+                )
             raw.append(r)
             if not self._is_error_result(r):
                 return r, raw, idx
@@ -2015,7 +2129,9 @@ class MonitorWorker(QThread):
         proxy = self.rotating_proxies[0]
         try:
             async with self._session_for(proxy) as session:
-                return await self.checker.fetch_product(session, asin, proxy)
+                return await self.checker.fetch_product(
+                    session, asin, proxy, minimal_headers=True
+                )
         except Exception as e:
             self.log.emit(f"Rotating confirm failed {asin}: {e}")
             return None
@@ -2110,7 +2226,7 @@ class MonitorWorker(QThread):
                 proxy = proxies[0]
                 async with self._session_for(proxy) as session:
                     result = await self.checker.fetch_product(
-                        session, asin, proxy
+                        session, asin, proxy, minimal_headers=True
                     )
                 next_idx = idx
             else:
@@ -2489,6 +2605,28 @@ class MonitorWorker(QThread):
         if not should:
             return False
 
+        # LAST LINE OF DEFENCE ON THE NAME.
+        #
+        # A ping is public and permanent. If the scrape handed us page
+        # furniture instead of a product name (Amazon moved the wishlist
+        # title into an attribute and left "Quick View" as the link text,
+        # which went out to the server), fall back to the name stored in
+        # the database rather than announcing nonsense.
+        if not is_real_title(result.get("title") or ""):
+            for fallback in (
+                (self.latest_result.get(asin) or {}).get("title"),
+                product.get("title"),
+                (self.wishlist_results.get(asin) or {}).get("title"),
+            ):
+                if is_real_title(fallback or ""):
+                    self.log.emit(
+                        f"⚠️ {asin} scraped title was "
+                        f"{(result.get('title') or '')[:30]!r}; using the "
+                        f"stored name instead."
+                    )
+                    result = dict(result, title=fallback)
+                    break
+
         # STARTUP SWEEP: no pings until the boot stock list has gone
         # out. The item stays armed; if it's still at target when the
         # list is built, the list latches it "fired" (it's visible on
@@ -2855,6 +2993,15 @@ class MonitorWorker(QThread):
         else:
             headers["Sec-Fetch-User"] = "?1"
             headers["Upgrade-Insecure-Requests"] = "1"
+
+        if self._is_rotating(proxy):
+            # Same finding as fetch_product: through the rotating IPv6
+            # gateway a hand-built header block is ~97% blocked while
+            # letting curl_cffi's Chrome impersonation speak for itself
+            # is 0%. Keep only what actually changes the response.
+            headers = {"Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8"}
+            if is_more:
+                headers["X-Requested-With"] = "XMLHttpRequest"
         try:
             # A rotating gateway needs its own connection per request or
             # every page of the crawl comes from the same exit IP, which
@@ -2864,7 +3011,9 @@ class MonitorWorker(QThread):
                     url,
                     headers=headers,
                     proxy=proxy,
-                    timeout=HTTP_TIMEOUT_SECONDS + 4,
+                    timeout=(ROTATING_TIMEOUT_SECONDS
+                             if self._is_rotating(proxy)
+                             else HTTP_TIMEOUT_SECONDS + 4),
                     allow_redirects=True,
                 )
             if r.status_code >= 400:
@@ -3169,12 +3318,24 @@ class MonitorWorker(QThread):
                 else:
                     freshness = f"checked every 0.0s ({good_rate:.1f}/s)"
 
+                # Rotating-gateway pressure. The plan sells THREADS, so
+                # peak concurrency is the number that decides whether the
+                # gateway starts refusing us. Only shown when in use.
+                rot = ""
+                if self.rotating_proxies and self._rot_peak:
+                    rot = (f" | rot peak {self._rot_peak}/"
+                           f"{ROTATING_MAX_CONCURRENT}")
+                    if self._rot_waited:
+                        rot += f", {self._rot_waited} queued"
+                self._rot_peak = self._rot_inflight
+                self._rot_waited = 0
+
                 self.log.emit(
                     f"⚡ {tracked} tracked, {in_stock} in stock | "
                     f"{freshness} | {crawl_pct:.0f}% crawl, "
                     f"{100 - crawl_pct:.0f}% own | /dp/ "
                     f"{dp_att / SCAN_RATE_LOG_SECONDS:.1f}/s, "
-                    f"{dp_blk_pct:.0f}% blocked | {err_pct:.1f}% stale"
+                    f"{dp_blk_pct:.0f}% blocked | {err_pct:.1f}% stale{rot}"
                 )
             except Exception as e:
                 self.log.emit(f"Scan-rate log error: {e}")
