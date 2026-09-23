@@ -279,6 +279,29 @@ DP_BACKOFF_SECONDS = 2.0
 # Set DP_PRIMARY = False to fall straight back to crawl-primary.
 DP_PRIMARY = False
 
+# ROTATING-GATEWAY POOL (second, optional proxy pool).
+#
+# A rotating provider is ONE endpoint that hands out a different exit IP
+# on every request. That breaks two assumptions the pool code makes:
+#
+#   1. Rotation. We do not rotate; the gateway does. One entry IS the
+#      whole pool, and reusing it is correct rather than a mistake.
+#   2. Cooldown. evaluate_proxy_cooldown benches a proxy by host:port
+#      after a run of blocks. Every rotated exit shares ONE host:port, so
+#      a few blocked exits would bench the ENTIRE pool for 15 minutes.
+#      Rotating entries are therefore exempt: a block on one exit says
+#      nothing about the next, which is the whole point of rotation.
+#
+# File format matches proxies.txt (host:port:user:pass). Absent or empty
+# means nothing changes and the bot behaves exactly as it does today.
+ROTATING_PROXY_FILE = "proxies_rotating.txt"
+
+# Staged rollout. Confirms first: lowest volume, highest value, and the
+# cleanest place to read a block rate. Flip the monitor flag only once
+# the confirm numbers look good.
+ROTATING_FOR_CONFIRM = True
+ROTATING_FOR_MONITOR = False
+
 # Sleep between a product's own fetches in DP_PRIMARY mode.
 #
 # This CANNOT be 0. A successful fetch takes ~1.5s, but a blocked one
@@ -554,6 +577,34 @@ def extract_price_number(price_text):
         return float(match.group())
     except ValueError:
         return None
+
+
+def load_rotating_proxies() -> List[str]:
+    """Load the optional rotating-gateway pool.
+
+    Same line formats as load_proxies(). Returns [] when the file is
+    missing or empty, which is the signal to behave exactly as before.
+    Socks5 is accepted as-is, since rotating providers often offer both.
+    """
+    path = PROXIES_FILE.parent / ROTATING_PROXY_FILE
+    out: List[str] = []
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if (line.startswith("http://") or line.startswith("https://")
+                or line.startswith("socks")):
+            out.append(line)
+            continue
+        parts = line.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            out.append(f"http://{user}:{pw}@{host}:{port}")
+        elif len(parts) == 2:
+            out.append(f"http://{line}")
+    return out
 
 
 def load_proxies() -> List[Optional[str]]:
@@ -1303,6 +1354,10 @@ class MonitorWorker(QThread):
         self._crawl_cycle_ms: Optional[float] = None
         # ASINs with an instant /dp/ confirm in flight (dedupe).
         self._confirming: set = set()
+        # Optional rotating-gateway pool, plus the labels that belong to
+        # it so the cooldown can leave them alone.
+        self.rotating_proxies: List[str] = []
+        self._rotating_labels: set = set()
         # Burst-confirm deadline (monotonic). While now < this, the
         # wishlist crawler runs at WISHLIST_BURST_SLEEP cadence to race
         # the confirming read of a targeted item that just went in stock.
@@ -1508,6 +1563,12 @@ class MonitorWorker(QThread):
         if not proxy_label:
             proxy_label = "direct"
         if proxy_label == "direct":
+            return
+        # A rotating gateway is one host:port serving a different exit IP
+        # per request. Benching it on a run of blocks would take the whole
+        # pool offline for 15 minutes because of a handful of bad exits,
+        # which is the opposite of what rotation is for.
+        if proxy_label in self._rotating_labels:
             return
 
         stats = self.proxy_stats.get(proxy_label)
@@ -1869,7 +1930,15 @@ class MonitorWorker(QThread):
         price, not a wishlist row that may be showing some other offer.
         """
         try:
-            proxies = self.scan_proxies or [None]
+            # Prefer the rotating pool for the confirm when we have one.
+            # This is the single request that decides whether thousands of
+            # people get pinged, so it is worth spending the best IPs we
+            # have on it: a fresh exit per request is the hardest thing
+            # for Amazon to rate-limit.
+            if ROTATING_FOR_CONFIRM and self.rotating_proxies:
+                proxies = list(self.rotating_proxies)
+            else:
+                proxies = self.scan_proxies or [None]
             key = f"__confirm_{asin}"
             idx = self.proxy_indexes.get(key, 0)
             result, _raw, next_idx = await self.checker.check_product_parallel(
@@ -3366,6 +3435,25 @@ class MonitorWorker(QThread):
             # outside the per-product loops and need their own rotation.
             self.scan_proxies = list(proxies)
             self.log.emit(f"HTTP checker loaded {len(proxies)} source(s).")
+
+            # Optional rotating-gateway pool.
+            self.rotating_proxies = load_rotating_proxies()
+            self._rotating_labels = {
+                proxy_label_from_url(p) for p in self.rotating_proxies
+            }
+            if self.rotating_proxies:
+                uses = []
+                if ROTATING_FOR_CONFIRM:
+                    uses.append("ping confirms")
+                if ROTATING_FOR_MONITOR:
+                    uses.append("monitoring")
+                    proxies = list(self.rotating_proxies)
+                    self.scan_proxies = list(proxies)
+                self.log.emit(
+                    f"🔄 Rotating pool loaded: {len(self.rotating_proxies)} "
+                    f"gateway(s), exempt from cooldown, used for "
+                    f"{' + '.join(uses) if uses else 'nothing (both flags off)'}."
+                )
 
             semaphore = asyncio.Semaphore(HTTP_CONCURRENCY)
             checker = HTTPAmazonChecker(domain, semaphore)
