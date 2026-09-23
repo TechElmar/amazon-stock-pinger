@@ -119,7 +119,19 @@ CHECK_INTERVAL_FALLBACK_SECONDS = 1.0
 PROXY_MIN_CHECKS_BEFORE_COOLDOWN = 50
 PROXY_BLOCK_RATE_COOLDOWN_THRESHOLD = 0.70
 PROXY_ERROR_RATE_COOLDOWN_THRESHOLD = 0.50
-PROXY_BLOCK_COOLDOWN_MINUTES = 15
+# How long a blocked proxy sits out.
+#
+# Was 15 minutes, which was costing far more capacity than it saved.
+# Measured on the live pool: 11 of 15 proxies were benched inside a
+# single 15-minute window, so the bot was frequently rotating over only
+# 4-8 usable IPs and blocking hit 93%.
+#
+# Amazon's blocks are demonstrably shorter than the bench was: the pool
+# recovered from 93% blocked to 22% in about four minutes on its own. A
+# 15-minute timeout therefore kept IPs sidelined long after Amazon had
+# forgiven them. Five minutes still sheds a genuinely hot proxy but
+# returns it while it is still useful.
+PROXY_BLOCK_COOLDOWN_MINUTES = 5
 PROXY_ERROR_COOLDOWN_MINUTES = 10
 
 # Per-ASIN cursed detection — high HTTP fail-rate ASINs get a parallel
@@ -407,7 +419,16 @@ OOS_CONFIRM_SCANS = 6
 # effective state flips at all. At crawl cadence that is several seconds
 # of solid, agreed-upon OOS. Two minutes on top of that is a real
 # sellout, not parse noise.
-MIN_RESTOCK_OOS_SECONDS = 120
+MIN_RESTOCK_OOS_SECONDS = 300
+
+# Hard cap on how often ONE item may ping, whatever the reason. Restocks
+# and price drops are allowed to skip the softer anti-nag timers because
+# they are genuine news, but nothing skips this. It exists so that a
+# single misclassification can never again spam 9000 people: on
+# 2026-09-17 a buy-box handover between Amazon and a reseller was read as
+# a restock and fired 14 pings in a day, five of them 14 minutes apart at
+# an identical price.
+ABSOLUTE_MIN_REPING_SECONDS = 20 * 60
 TARGET_REARM_MARGIN = 0.05                 # price must exceed target by 5%
 MIN_TARGET_REPING_SECONDS = 3 * 60 * 60    # ≥3h between pings per item
 
@@ -1425,6 +1446,12 @@ class MonitorWorker(QThread):
         # after IN_STOCK_CONFIRM_SCANS, OOS after OOS_CONFIRM_SCANS.
         self.consec_in_stock: Dict[str, int] = {}
         self.consec_oos: Dict[str, int] = {}
+        # Why the latest reading was "oos": "out_of_stock" (a real
+        # sellout) or "third_party" (the item is in stock, just not sold
+        # by Amazon). Only the former makes a comeback a restock.
+        self._oos_cause: Dict[str, str] = {}
+        self._oos_was_real: Dict[str, bool] = {}
+        self._floor_logged: set = set()
         self.effective_state: Dict[str, Optional[str]] = {}
 
         # Per-ASIN epoch timestamp marking when the current confirmed-OOS
@@ -1819,6 +1846,7 @@ class MonitorWorker(QThread):
             return "unknown"
         # Definitive OOS.
         if "out of stock" in stock_text:
+            self._oos_cause[asin] = "out_of_stock"
             return "oos"
         # In-stock variants require a real parsed price; without one
         # we can't trust the signal and shouldn't risk a wrong ping.
@@ -1836,6 +1864,13 @@ class MonitorWorker(QThread):
         if sclass == "amazon":
             return "in_stock"
         if sclass == "third_party":
+            # The item IS in stock, just not sold by Amazon. For ping
+            # purposes that is "Amazon has none", but it is NOT the same
+            # event as a real sellout, and conflating them caused real
+            # spam: B0H2JVZYZZ bounced between Amazon.ca and Rarewaves-CA
+            # every ~10 minutes, and each handover back to Amazon looked
+            # like a restock and fired a ping. 14 pings in one day.
+            self._oos_cause[asin] = "third_party"
             return "oos"
         return "unknown"
 
@@ -2072,6 +2107,11 @@ class MonitorWorker(QThread):
             self.consec_oos[asin] = 0
         elif observation == "oos":
             self.consec_oos[asin] = self.consec_oos.get(asin, 0) + 1
+            # A run can START as a seller swap and later become a genuine
+            # sellout. Once we see one real out-of-stock read, the run
+            # counts as real from then on.
+            if self._oos_cause.get(asin) == "out_of_stock":
+                self._oos_was_real[asin] = True
             # Do NOT wipe the in-stock streak on a single OOS read.
             #
             # During a live drop Amazon serves different buy-box winners
@@ -2109,6 +2149,13 @@ class MonitorWorker(QThread):
                 self.log.emit(f"DB save_effective_state error: {e}")
 
             if new == "oos":
+                # Remember WHY this run went out of stock. A run caused
+                # only by a reseller holding the buy box is not a sellout,
+                # and its end is not a restock, so it must not open the
+                # ping gate. See _oos_cause in _categorize.
+                self._oos_was_real[asin] = (
+                    self._oos_cause.get(asin) == "out_of_stock"
+                )
                 # Just confirmed OOS — start the clock (only if not
                 # already running, so an existing run's start time is
                 # preserved across the flip).
@@ -2175,6 +2222,13 @@ class MonitorWorker(QThread):
         restock_comeback = (
             ended_oos_secs is not None
             and ended_oos_secs >= MIN_RESTOCK_OOS_SECONDS
+            # A run that was only ever "a reseller held the buy box" is
+            # not a sellout, so coming back is not a restock. Without
+            # this, an item whose buy box alternates between Amazon and a
+            # marketplace seller fires a fresh "Restocked" ping on every
+            # handover, which is exactly what spammed B0H2JVZYZZ 14 times
+            # in a day.
+            and self._oos_was_real.get(asin, False)
         )
         if restock_comeback and self.alert_state.get(asin) == "fired":
             self._set_alert_state(asin, "armed")
@@ -2268,6 +2322,25 @@ class MonitorWorker(QThread):
             prev_announced is not None
             and price_number < prev_announced - PRICE_DROP_EPSILON
         )
+
+        # ABSOLUTE FLOOR. Nothing bypasses this: not a restock, not a
+        # price drop, not any future "this is definitely news" rule.
+        #
+        # Yesterday's change let restocks skip every rate limit, and one
+        # bad classification then produced 14 pings in a day to a server
+        # of 9000 people. The specific bug is fixed above, but a single
+        # logic error should never again be able to spam that audience,
+        # so there is now a hard cap no reason can argue its way past.
+        secs_since_ping = time.time() - self.last_target_ping_at.get(asin, 0.0)
+        if secs_since_ping < ABSOLUTE_MIN_REPING_SECONDS:
+            if asin not in self._floor_logged:
+                self._floor_logged.add(asin)
+                self.log.emit(
+                    f"🛑 {asin} suppressed by the absolute {int(ABSOLUTE_MIN_REPING_SECONDS/60)}m "
+                    f"re-ping floor ({int(secs_since_ping/60)}m since last ping)."
+                )
+            return False, ""
+        self._floor_logged.discard(asin)
 
         if restock_comeback:
             return True, "Restocked — Target Price Reached"
