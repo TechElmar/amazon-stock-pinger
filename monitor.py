@@ -2641,17 +2641,51 @@ class MonitorWorker(QThread):
             return False, ""
         self._floor_logged.discard(asin)
 
-        if restock_comeback:
-            return True, "Restocked — Target Price Reached"
-        # A price BELOW what we last announced is new information too, and
-        # the cooldown below was silently eating it: the cooldown check ran
-        # first and returned before the same-price logic could let a drop
-        # through. The suppression message even promised "any drop below
-        # $X fires immediately", which was not true. Now it is.
+        # A price BELOW what we last announced is unambiguously news:
+        # a better deal than the one already sent. It skips everything.
+        #
+        # The cooldown used to eat these, because it was checked before
+        # the same-price logic could let a drop through. The suppression
+        # message even promised "any drop below $X fires immediately",
+        # which was not true. Now it is.
         if real_price_drop:
             return True, "Price Drop — Target Price Reached"
 
+        # A RESTOCK AT THE SAME PRICE IS NOT NEWS ENOUGH TO REPEAT.
+        #
+        # Restocks skip the 3h nag cooldown, because a genuine sellout
+        # and return is a real buying opportunity. They do NOT skip the
+        # same-price rule.
+        #
+        # Measured on Series 2 (B0GW2DK37Q): it genuinely restocked four
+        # times in six hours, selling out within 3-8 minutes each time,
+        # after real 1-3 hour gaps. Every ping was individually correct
+        # and the result was still spam, because it was the same item at
+        # the same $39.95 over and over.
+        #
+        # So: same price as last announced -> stay quiet until the
+        # same-price window expires. Any cheaper price fires instantly
+        # via the branch above, and a restock still beats the cooldown.
         last_ping = self.last_target_ping_at.get(asin, 0.0)
+        if (
+            restock_comeback
+            and prev_announced is not None
+            and price_number >= prev_announced - PRICE_DROP_EPSILON
+            and time.time() - last_ping < SAME_PRICE_REPING_SECONDS
+        ):
+            if asin not in self._same_price_logged:
+                self._same_price_logged.add(asin)
+                hrs = (SAME_PRICE_REPING_SECONDS
+                       - (time.time() - last_ping)) / 3600
+                self.log.emit(
+                    f"🔁 {asin} restocked but at the same "
+                    f"${prev_announced:.2f} already announced — holding "
+                    f"(~{hrs:.1f}h left, any lower price fires at once)."
+                )
+            return False, ""
+
+        if restock_comeback:
+            return True, "Restocked — Target Price Reached"
         if time.time() - last_ping < MIN_TARGET_REPING_SECONDS:
             if asin not in self._cooldown_logged:
                 self._cooldown_logged.add(asin)
