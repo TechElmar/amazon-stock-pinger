@@ -183,7 +183,24 @@ WISHLIST_PAGE_RETRIES = 4
 # what actually decides how fast one item is noticed. It still fills
 # the digest and covers products whose own fetch is failing.
 WISHLIST_CYCLE_SECONDS = 0.5
-WISHLIST_CYCLE_MIN_SLEEP = 0.2
+# Floor between crawl cycles. A cycle is ~1.5s of real fetching, so this
+# floor is almost never the limiter; keep it small so the crawl runs
+# genuinely back-to-back rather than idling between sweeps.
+WISHLIST_CYCLE_MIN_SLEEP = 0.05
+
+# PIPELINED CRAWL WORKERS.
+#
+# One worker must finish a whole sweep before starting the next, so an
+# item that restocks just after its page was read waits a full ~1.5s
+# cycle to be noticed. Running several staggered workers shortens that
+# blind window to roughly cycle/N without making any single sweep
+# faster: worker 1 reads at t=0, worker 2 at t=0.5, worker 3 at t=1.0.
+#
+# This is affordable precisely because it is the WISHLIST. That endpoint
+# is built to be shared publicly and is far less defended than /dp/:
+# measured ~3 req/s at essentially no block rate, where /dp/ was 67%
+# blocked at 11.7 req/s. Three workers is ~9 req/s of wishlist traffic.
+WISHLIST_CRAWL_WORKERS = 1
 
 # BURST-CONFIRM: the instant a targeted, armed item first reads in stock
 # at/below its target, the crawler drops into a short high-rate window so
@@ -206,7 +223,87 @@ WISHLIST_BURST_SLEEP = 0.1      # inter-cycle gap while bursting
 # few crawl cycles wide so the private fetch is the exception.
 WISHLIST_FRESH_SECONDS = 8.0
 
-WISHLIST_REDISCOVER_SECONDS = 60
+# How often to re-walk the pagination chain sequentially.
+#
+# Measured in production: a parallel cycle is ~1.7s, a sequential re-walk
+# is ~18s. At 60s this spent 18 of every 60 seconds crawling at a tenth
+# of normal speed, a recurring blind spot roughly 30% of the time.
+#
+# Re-walking is only needed when the pagination tokens go stale, and
+# that is already detected directly: if a parallel cycle's coverage
+# collapses below half the known items, _wl_page_urls is cleared and the
+# next cycle re-discovers immediately. So the timer is a backstop, not
+# the mechanism, and it can be much lazier.
+WISHLIST_REDISCOVER_SECONDS = 300
+
+# CRAWL-BLIND BACKOFF.
+#
+# Some items render on the wishlist with a title but no price, seller or
+# availability (the unreleased ones especially). The crawl can only ever
+# report "Unknown" for them, the freshness gate correctly refuses to
+# trust that, and so every one of them falls through to its own /dp/
+# fetch on EVERY cycle.
+#
+# Measured on the live box: 16 of 44 tracked items were crawl-blind,
+# driving ~10 req/s at /dp/ across 15 proxies, or one hit per IP every
+# 1.3s forever. /dp/ is the most WAF-protected endpoint we touch, and at
+# that rate Amazon blocks it: 2 of 3 sample fetches came back captcha.
+# A blocked fetch then falls back to wishlist data up to
+# WISHLIST_MERGE_TTL_SECONDS old, which is how a "sub-second" scan loop
+# ends up minutes behind reality.
+#
+# So a crawl-blind item polls /dp/ on this slower interval instead. It
+# loses nothing important: the wishlist scanner already calls the ping
+# gate for every row it reads, and the instant Amazon renders a price on
+# that row the item stops being crawl-blind and returns to full rate.
+# Burst mode is checked first, so a flip to in-stock still drops to
+# 100ms polling immediately.
+DP_BACKOFF_SECONDS = 2.0
+
+# PRODUCT-PAGE-PRIMARY MODE.
+#
+# When True every product reads its OWN /dp/ page on every scan, and the
+# wishlist crawl is demoted to exactly what it should be: a fallback for
+# when a product fetch is hard-blocked, plus the digest source.
+#
+# The wishlist is one request for ten products, which is why it was the
+# primary path. But it renders ONE offer per row, and that row is not
+# always the buy box: during the B0H78BB9TY drop the crawl alternated
+# $299.99 and $89.99 on successive reads. It also carries no price or
+# stock at all for 16 of the 44 tracked items.
+#
+# The cost is request volume: 44 products on a ~1.5s fetch is ~29 req/s
+# spread over the pool. Whether that is sustainable is a measured
+# question, not a theoretical one, so DP_PRIMARY_INTERVAL throttles it
+# and the heartbeat reports "/dp/ N/s, X% blocked" to show the answer.
+# Set DP_PRIMARY = False to fall straight back to crawl-primary.
+DP_PRIMARY = False
+
+# Sleep between a product's own fetches in DP_PRIMARY mode.
+#
+# This CANNOT be 0. A successful fetch takes ~1.5s, but a blocked one
+# comes back in ~85ms, so with no floor the loop spins ~12x faster
+# exactly when Amazon is refusing us: 44 products would generate ~500
+# req/s and destroy the pool in seconds. Measured in test at 101,188
+# iterations per second against an instant-returning stub.
+#
+# Healthy: 44 / (1.5 + 0.75) = ~20 req/s.
+DP_PRIMARY_INTERVAL = 0.75
+
+# Backoff after a BLOCKED fetch. This is what bounds the failure spiral:
+# if every fetch is blocked, 44 / (0.1 + 3.0) = ~14 req/s, so the pool
+# gets quieter under pressure instead of louder.
+DP_PRIMARY_BLOCKED_INTERVAL = 3.0
+
+# Crawl cycle while demoted to fallback duty. Slow, because every
+# wishlist request is one the product pages do not get.
+DP_PRIMARY_CRAWL_SECONDS = 15.0
+
+# A product whose last trustworthy reading is older than this is flagged
+# in the heartbeat. Sized well above the crawl-blind backoff so a normal
+# backed-off item does not trip it, but low enough that a genuinely
+# neglected product shows up long before a drop is missed.
+STALE_PRODUCT_SECONDS = 20.0
 # How often to emit the coverage log line (the crawl runs many cycles
 # per second; we don't want a log line every cycle).
 WISHLIST_CRAWL_LOG_SECONDS = 30
@@ -274,7 +371,20 @@ OOS_CONFIRM_SCANS = 6
 #     the item's last ping (hard per-item rate cap, belt & braces).
 # The latch persists to the DB (products.alert_state) so restarts
 # never replay pings for items already announced.
-MIN_RESTOCK_OOS_SECONDS = 60 * 60          # OOS run needed to re-arm
+# OOS run needed before a comeback counts as a genuine restock.
+#
+# This was 1 HOUR, and it silently ate real drops. A item that pinged,
+# sold out in ten minutes and came back forty minutes later produced NO
+# ping: the OOS run was under the hour, so the latch never re-armed.
+# Pokemon restocks arrive in waves minutes to hours apart, at the same
+# MSRP, which is exactly the shape this rule rejected.
+#
+# Flapping is already handled upstream and does not need an hour on top:
+# OOS_CONFIRM_SCANS requires 6 consecutive out-of-stock reads before the
+# effective state flips at all. At crawl cadence that is several seconds
+# of solid, agreed-upon OOS. Two minutes on top of that is a real
+# sellout, not parse noise.
+MIN_RESTOCK_OOS_SECONDS = 120
 TARGET_REARM_MARGIN = 0.05                 # price must exceed target by 5%
 MIN_TARGET_REPING_SECONDS = 3 * 60 * 60    # ≥3h between pings per item
 
@@ -335,8 +445,22 @@ def with_affiliate_tag(url: str) -> str:
 SELLER_CLASS_TTL = {
     "amazon": 600,
     "third_party": 120,
-    "unknown": 45,
+    # A cached "unknown" carries no information: it cannot open the ping
+    # gate and it cannot close it. Holding one for 45s only meant we
+    # REFUSED TO RETRY for 45s. /dp/ seller reads fail ~49% of the time,
+    # so an in-stock item at target routinely waited 45s, 90s or 135s
+    # before it could ping. That was the 2-3 minute lateness.
+    #
+    # Retrying costs little: _resolve_seller is only reached for items
+    # that already look in stock WITH a parsed price, which is a handful
+    # at a time, never the whole watchlist.
+    "unknown": 3,
 }
+
+# Longest a decisive seller reading may be reused while a fresh one
+# cannot be obtained. Sellers change rarely, and a stale "amazon" is a
+# far better answer than "unknown", which stalls the ping entirely.
+SELLER_STALE_FALLBACK_SECONDS = 6 * 60 * 60
 
 # Amazon retail seller names. Matched case-insensitively after
 # whitespace-normalization and trailing-dot strip. The regex covers
@@ -1160,6 +1284,25 @@ class MonitorWorker(QThread):
         self._scan_count: int = 0
         self._scan_from_crawl: int = 0
         self._scan_errors: int = 0
+        # /dp/ fetch health for the heartbeat, reset each log window.
+        self._dp_attempts: int = 0
+        self._dp_blocked: int = 0
+        # Monotonic stamp of the last TRUSTWORTHY reading per ASIN.
+        # A fleet average hides starvation: 16 items can be minutes
+        # behind while the mean still reads "1.2s" because the other 28
+        # are fine. This is what the heartbeat reports on instead.
+        self._last_good_scan: Dict[str, float] = {}
+        # Smoothed gap between consecutive good readings, per ASIN. The
+        # AGE of the last reading is not the refresh interval: sampled at
+        # a random moment it averages half of it, which would report a
+        # 1s loop as "0.5s" and a freshly restarted one as "0.0s". This
+        # measures the interval itself.
+        self._good_gap: Dict[str, float] = {}
+        # Smoothed wishlist crawl cycle time in ms. This is the ceiling
+        # on how late a ping can be for any item the crawl covers.
+        self._crawl_cycle_ms: Optional[float] = None
+        # ASINs with an instant /dp/ confirm in flight (dedupe).
+        self._confirming: set = set()
         # Burst-confirm deadline (monotonic). While now < this, the
         # wishlist crawler runs at WISHLIST_BURST_SLEEP cadence to race
         # the confirming read of a targeted item that just went in stock.
@@ -1317,6 +1460,22 @@ class MonitorWorker(QThread):
         if stock.startswith("http"):
             return False
         return True
+
+    def _is_crawl_blind(self, asin: str) -> bool:
+        """True when the crawl holds a row for this ASIN that says nothing
+        about stock.
+
+        Such an item can never satisfy the freshness gate, so it fetches
+        its own /dp/ page every cycle and burns proxy budget on the one
+        endpoint Amazon actually defends. See DP_BACKOFF_SECONDS.
+
+        An ASIN the crawl has lost entirely is NOT crawl-blind: the crawl
+        is not covering it at all, so it must keep fetching at full rate.
+        """
+        seen = self._wishlist_seen.get(asin)
+        if seen is None:
+            return False
+        return (seen[0].get("stock") or "").strip() in ("", "Unknown")
 
     def _is_error_result(self, result: Dict[str, Any]) -> bool:
         """True when a scan produced no usable observation (block,
@@ -1645,6 +1804,23 @@ class MonitorWorker(QThread):
             if age <= SELLER_CLASS_TTL.get(entry["class"], 45):
                 return entry["class"]
 
+            # STALE BUT DECISIVE. Re-verify in the background and answer
+            # with what we already know rather than stalling.
+            #
+            # Returning "unknown" here closes the ping gate completely:
+            # _categorize maps it to "unknown", the hysteresis counters
+            # do not advance, and the item sits in stock and unpingable
+            # until a /dp/ read succeeds. Those reads fail ~49% of the
+            # time and fail WORST during a drop, which is precisely when
+            # the ping matters. A seller almost never changes between
+            # one scan and the next, so last-known is the better guess.
+            if (
+                entry["class"] in ("amazon", "third_party")
+                and age <= SELLER_STALE_FALLBACK_SECONDS
+            ):
+                self._request_seller_verification(asin)
+                return entry["class"]
+
         # No usable info — verify in the background, stay unknown now.
         self._request_seller_verification(asin)
         return "unknown"
@@ -1667,6 +1843,82 @@ class MonitorWorker(QThread):
             return
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
+
+    def _request_instant_confirm(self, asin: str) -> None:
+        """Fire the confirming read NOW instead of waiting for the next
+        crawl cycle. Deduped: one in flight per ASIN."""
+        if self.checker is None or self.scan_session is None:
+            return
+        if asin in self._confirming:
+            return
+        self._confirming.add(asin)
+        try:
+            task = asyncio.create_task(self._instant_confirm(asin))
+        except RuntimeError:          # no running loop (unit tests)
+            self._confirming.discard(asin)
+            return
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+
+    async def _instant_confirm(self, asin: str) -> None:
+        """Race this product's /dp/ page across several proxies and feed
+        the first real answer straight into the ping gate.
+
+        This is the read that actually fires the alert, so it is the one
+        that must be trustworthy: the buy box, the real seller, the real
+        price, not a wishlist row that may be showing some other offer.
+        """
+        try:
+            proxies = self.scan_proxies or [None]
+            key = f"__confirm_{asin}"
+            idx = self.proxy_indexes.get(key, 0)
+            result, _raw, next_idx = await self.checker.check_product_parallel(
+                self.scan_session,
+                asin,
+                proxies,
+                self.is_proxy_available,
+                idx,
+                n_parallel=CURSED_PARALLEL_PROXIES,
+            )
+            self.proxy_indexes[key] = next_idx
+
+            if self._is_error_result(result):
+                # Blocked or timed out. Say nothing: the crawl's own next
+                # cycle is still coming, so this only ever ADDS a chance
+                # to fire early, it never removes one.
+                return
+
+            product = (self._enabled_products() or {}).get(asin)
+            if not product:
+                return
+            self._maybe_announce(
+                product, dict(result), source="dp/instant-confirm"
+            )
+        except Exception as e:
+            self.log.emit(f"Instant confirm error {asin}: {e}")
+        finally:
+            self._confirming.discard(asin)
+
+    def _note_seller_verify_failed(self, asin: str, prev_entry: dict) -> None:
+        """Record that a seller read failed WITHOUT destroying what we
+        already knew.
+
+        A decisive previous reading keeps its class and its original
+        timestamp, so it continues to age normally and stays eligible
+        for the stale fallback. Only an ASIN we have never resolved is
+        parked as "unknown", and that entry expires in seconds so the
+        next scan retries instead of waiting out a long TTL.
+        """
+        prev_class = prev_entry.get("class")
+        if prev_class in ("amazon", "third_party"):
+            entry = dict(prev_entry)
+            entry["failed_at"] = time.time()
+            self.seller_cache[asin] = entry
+            return
+        self.seller_cache[asin] = {
+            "seller": "", "class": "unknown", "ts": time.time(),
+            "failed_at": time.time(),
+        }
 
     async def _verify_seller(self, asin: str) -> None:
         """Background /dp/ fetch to extract the buy-box seller, cached
@@ -1693,21 +1945,34 @@ class MonitorWorker(QThread):
             )
             self.proxy_indexes[key] = next_idx
             seller = clean(result.get("seller") or "")
+            prev_entry = self.seller_cache.get(asin) or {}
+            prev = prev_entry.get("class")
+
+            if not seller:
+                # We could not READ the merchant (WAF block, timeout, no
+                # buy box). That is a failed read, not a finding, and it
+                # must NOT clobber a seller we already established:
+                # overwriting "Amazon.ca" with "unknown" on one blocked
+                # fetch is what turned a transient block into a ping
+                # lockout on a live drop. Leave the known value and its
+                # original age in place so the stale-fallback in
+                # _resolve_seller can still answer.
+                self._note_seller_verify_failed(asin, prev_entry)
+                return
+
             cls = seller_class(seller)
-            prev = (self.seller_cache.get(asin) or {}).get("class")
             self.seller_cache[asin] = {
                 "seller": seller, "class": cls, "ts": time.time(),
             }
             if cls != prev:
                 self.log.emit(
-                    f"🏷️ {asin} seller verified via /dp/: "
-                    f"{seller or 'undetermined'} [{cls}]"
+                    f"🏷️ {asin} seller verified via /dp/: {seller} [{cls}]"
                 )
         except Exception as e:
             self.log.emit(f"Seller verify error {asin}: {e}")
-            self.seller_cache[asin] = {
-                "seller": "", "class": "unknown", "ts": time.time(),
-            }
+            self._note_seller_verify_failed(
+                asin, self.seller_cache.get(asin) or {}
+            )
         finally:
             self._verifying.discard(asin)
 
@@ -1738,7 +2003,22 @@ class MonitorWorker(QThread):
             self.consec_oos[asin] = 0
         elif observation == "oos":
             self.consec_oos[asin] = self.consec_oos.get(asin, 0) + 1
-            self.consec_in_stock[asin] = 0
+            # Do NOT wipe the in-stock streak on a single OOS read.
+            #
+            # During a live drop Amazon serves different buy-box winners
+            # to different CloudFront edges, so reads genuinely alternate:
+            # one proxy sees Amazon at $89.99 (in_stock), the next sees a
+            # third-party offer at $299.99, which _categorize calls "oos".
+            # Zeroing here meant each 3P read erased the progress of the
+            # Amazon read before it, and the 2-read confirm could never
+            # complete. Measured on B0H78BB9TY: in stock at target from
+            # 20:04:49, ping not fired until 20:11:58. Seven minutes.
+            #
+            # The asymmetric thresholds already encode the intent that a
+            # false OOS is the costly mistake, so clearing the in-stock
+            # streak now needs the same CONFIRMED run that flips state.
+            if self.consec_oos[asin] >= OOS_CONFIRM_SCANS:
+                self.consec_in_stock[asin] = 0
         # "unknown": leave counters untouched
 
         prev = self.effective_state.get(asin)
@@ -1854,6 +2134,18 @@ class MonitorWorker(QThread):
                 self._wishlist_burst_until = (
                     time.monotonic() + WISHLIST_BURST_SECONDS
                 )
+                # INSTANT CONFIRM. Do not wait out another crawl cycle
+                # for confirming read #2: go straight to this product's
+                # own /dp/ page, raced across several proxies, and let
+                # the first real answer decide.
+                #
+                # Two wins in one. It is ~0.7s instead of a ~1.5s cycle,
+                # and it is AUTHORITATIVE: the wishlist renders one offer
+                # per row which is not always the buy box, which is how
+                # B0H78BB9TY showed $299.99 and $89.99 on alternating
+                # reads. The product page shows the real buy box, so no
+                # ping ever goes out on a row the page does not back up.
+                self._request_instant_confirm(asin)
 
         # HARD GATE: a ping can only fire off a scan that is itself a
         # seller-confirmed Amazon in-stock read, with the confirmed
@@ -1891,6 +2183,33 @@ class MonitorWorker(QThread):
         if self.alert_state.get(asin, "armed") != "armed":
             return False, ""
 
+        # A GENUINE RESTOCK IS NEWS, NOT NAGGING.
+        #
+        # The cooldown and same-price rules below exist for one case: a
+        # listing that never left stock and would otherwise re-announce
+        # itself every few hours (the Series 2 problem). They must not
+        # apply to an item that actually sold out and came back, which is
+        # a new buying opportunity and the entire point of the bot.
+        #
+        # restock_comeback is only true after a CONFIRMED out-of-stock run
+        # (6 agreeing reads) lasting at least MIN_RESTOCK_OOS_SECONDS, so
+        # this cannot be tripped by flapping.
+        prev_announced = self.last_pinged_price.get(asin)
+        real_price_drop = (
+            prev_announced is not None
+            and price_number < prev_announced - PRICE_DROP_EPSILON
+        )
+
+        if restock_comeback:
+            return True, "Restocked — Target Price Reached"
+        # A price BELOW what we last announced is new information too, and
+        # the cooldown below was silently eating it: the cooldown check ran
+        # first and returned before the same-price logic could let a drop
+        # through. The suppression message even promised "any drop below
+        # $X fires immediately", which was not true. Now it is.
+        if real_price_drop:
+            return True, "Price Drop — Target Price Reached"
+
         last_ping = self.last_target_ping_at.get(asin, 0.0)
         if time.time() - last_ping < MIN_TARGET_REPING_SECONDS:
             if asin not in self._cooldown_logged:
@@ -1910,10 +2229,8 @@ class MonitorWorker(QThread):
         # bouncing OOS→in-stock would otherwise re-fire the identical
         # ping every few hours. Only a real price DROP, or a full
         # SAME_PRICE_REPING_SECONDS of quiet, gets to speak again.
-        prev_announced = self.last_pinged_price.get(asin)
         if (
             prev_announced is not None
-            and price_number >= prev_announced - PRICE_DROP_EPSILON
             and time.time() - last_ping < SAME_PRICE_REPING_SECONDS
         ):
             if asin not in self._same_price_logged:
@@ -2024,6 +2341,9 @@ class MonitorWorker(QThread):
         burst_until = 0.0
 
         while self.running:
+            # Set inside the scan when Amazon refuses the fetch; drives the
+            # backoff below so a blocked pool gets quieter, not louder.
+            was_blocked = False
             try:
                 # FRESHNESS-GATED SOURCE SELECTION.
                 #
@@ -2042,7 +2362,8 @@ class MonitorWorker(QThread):
                 # case, and no product can go stale unnoticed.
                 seen = self._wishlist_seen.get(asin)
                 fresh = (
-                    seen is not None
+                    not DP_PRIMARY
+                    and seen is not None
                     and (time.monotonic() - seen[1]) <= WISHLIST_FRESH_SECONDS
                     # Fresh is not enough: the reading has to SAY something.
                     # Some items (unreleased ones especially) render on the
@@ -2090,6 +2411,15 @@ class MonitorWorker(QThread):
                     self.proxy_indexes[asin] = new_idx
                     proxy_source = result.get("source", "direct")
 
+                    # /dp/ health, reported separately in the heartbeat.
+                    # A blocked fetch returns in ~85ms where a real one
+                    # takes ~1500ms, so counting attempts alone makes a
+                    # blocked pool look FASTER than a healthy one.
+                    self._dp_attempts += 1
+                    if "blocked" in (result.get("stock") or "").lower():
+                        self._dp_blocked += 1
+                        was_blocked = True
+
                     for r in raw_results:
                         src = r.get("source", "direct")
                         self.update_proxy_stats(src, r["stock"])
@@ -2109,8 +2439,28 @@ class MonitorWorker(QThread):
                 self._scan_count += 1
                 if fresh:
                     self._scan_from_crawl += 1
+                    good_read = True
                 elif used_wishlist:
                     self._scan_errors += 1
+                    good_read = False
+                else:
+                    # Our own fetch. Only counts if it actually came back
+                    # with something: a captcha is not an observation.
+                    good_read = not self._is_error_result(result)
+                if good_read:
+                    now_good = time.monotonic()
+                    prev_good = self._last_good_scan.get(asin)
+                    if prev_good is not None:
+                        gap = now_good - prev_good
+                        prev_gap = self._good_gap.get(asin)
+                        # EMA, so one slow cycle does not dominate the
+                        # reported figure and one fast one cannot hide a
+                        # product that is usually starving.
+                        self._good_gap[asin] = (
+                            gap if prev_gap is None
+                            else prev_gap * 0.7 + gap * 0.3
+                        )
+                    self._last_good_scan[asin] = now_good
 
                 self.update_asin_stats(asin, [result] if raw_results == [] else raw_results)
                 self.evaluate_asin_cursed(asin)
@@ -2193,10 +2543,27 @@ class MonitorWorker(QThread):
             except Exception as e:
                 self.log.emit(f"ERROR {asin}: {e}")
 
-            if time.monotonic() < burst_until:
+            if DP_PRIMARY:
+                # Straight back to the product page. No crawl-blind
+                # backoff here: in this mode /dp/ IS the detector, so
+                # backing it off would be backing off the only thing
+                # that can see a restock. But a BLOCKED fetch returns in
+                # ~85ms, so without the longer backoff the loop would
+                # accelerate under refusal instead of yielding.
+                await asyncio.sleep(
+                    DP_PRIMARY_BLOCKED_INTERVAL if was_blocked
+                    else DP_PRIMARY_INTERVAL
+                )
+            elif time.monotonic() < burst_until:
                 await asyncio.sleep(0.1)
             elif asin in self.cursed_asins:
                 await asyncio.sleep(CURSED_SCAN_INTERVAL)
+            elif self._is_crawl_blind(asin):
+                # Checked AFTER burst so a flip to in-stock still polls
+                # at 100ms. This only slows the idle case, where every
+                # fetch was landing on an item the crawl already cannot
+                # describe and Amazon is increasingly refusing to serve.
+                await asyncio.sleep(DP_BACKOFF_SECONDS)
             else:
                 await asyncio.sleep(self._read_interval())
 
@@ -2221,7 +2588,15 @@ class MonitorWorker(QThread):
         if not results:
             return
 
-        if self.notifier is not None and self.discord_session is not None:
+        # In product-page-primary mode the crawl must NOT drive the ping
+        # gate. Its rows carry one offer each, not necessarily the buy
+        # box, so letting it advance the hysteresis counters would feed
+        # the exact flapping readings we are trying to stop trusting.
+        # It still merges into _wishlist_seen below, which keeps it
+        # available as the fallback when a product fetch is blocked.
+        if DP_PRIMARY:
+            pass
+        elif self.notifier is not None and self.discord_session is not None:
             # Cached enabled-products snapshot (5s TTL) — this method
             # runs on every wishlist probe (~13x/sec); a fresh SQLite
             # query each time was pure waste.
@@ -2321,6 +2696,7 @@ class MonitorWorker(QThread):
     async def wishlist_http_scanner_forever(
         self,
         proxies: List[Optional[str]],
+        worker_id: int = 0,
     ) -> None:
         """Paginated HTTP wishlist crawler — the primary stock detector.
 
@@ -2346,13 +2722,17 @@ class MonitorWorker(QThread):
         if not rotation:
             rotation = [None]
 
-        self.log.emit(
-            f"HTTP wishlist crawler launching: {len(rotation)} proxies, "
-            f"paginated full-list walk (up to {WISHLIST_MAX_PAGES} pages/cycle)."
-        )
+        if worker_id == 0:
+            self.log.emit(
+                f"HTTP wishlist crawler launching: {len(rotation)} proxies, "
+                f"{WISHLIST_CRAWL_WORKERS} staggered worker(s), paginated "
+                f"full-list walk (up to {WISHLIST_MAX_PAGES} pages/cycle)."
+            )
 
         domain = self.wishlist_scanner.amazon_domain
-        proxy_idx = 0
+        # Start each worker on a different proxy so simultaneous sweeps do
+        # not queue up behind the same IP.
+        proxy_idx = worker_id * max(1, len(rotation) // max(1, WISHLIST_CRAWL_WORKERS))
 
         def next_proxy() -> Optional[str]:
             nonlocal proxy_idx
@@ -2417,13 +2797,35 @@ class MonitorWorker(QThread):
             return seen
 
         last_discovery = 0.0
+
+        # Stagger this worker into its slot so the workers land evenly
+        # across the cycle rather than all sweeping at the same instant.
+        if worker_id:
+            await asyncio.sleep(
+                (WISHLIST_CYCLE_SECONDS * worker_id)
+                / max(1, WISHLIST_CRAWL_WORKERS)
+            )
+
         while self.running:
             cycle_start = time.monotonic()
             try:
+                # Only worker 0 owns the sequential re-walk. It is ~18s
+                # and it establishes the shared page-URL chain, so having
+                # every worker do it would multiply the slowest operation
+                # in the system for no extra coverage.
                 need_discovery = (
-                    not self._wl_page_urls
-                    or cycle_start - last_discovery >= WISHLIST_REDISCOVER_SECONDS
+                    worker_id == 0
+                    and (
+                        not self._wl_page_urls
+                        or cycle_start - last_discovery
+                        >= WISHLIST_REDISCOVER_SECONDS
+                    )
                 )
+                if worker_id and not self._wl_page_urls:
+                    # Chain not built yet: wait for worker 0 rather than
+                    # racing it with a second sequential walk.
+                    await asyncio.sleep(0.5)
+                    continue
                 if need_discovery:
                     page_urls, seen = await discover()
                     if page_urls:
@@ -2446,17 +2848,34 @@ class MonitorWorker(QThread):
                 self._last_crawl_pages = len(self._wl_page_urls)
                 if seen:
                     now_mono = time.monotonic()
+                    # Cycle time IS the ping latency: the crawl calls the
+                    # ping gate for every item on every cycle, so an item
+                    # can go unnoticed for at most one cycle. Track it as
+                    # a smoothed figure and report it, because it is the
+                    # single number that decides how late a ping can be.
+                    cyc = now_mono - cycle_start
+                    self._crawl_cycle_ms = (
+                        cyc * 1000 if self._crawl_cycle_ms is None
+                        else self._crawl_cycle_ms * 0.7 + cyc * 1000 * 0.3
+                    )
                     if now_mono - getattr(self, "_last_crawl_log", 0) >= WISHLIST_CRAWL_LOG_SECONDS:
                         self._last_crawl_log = now_mono
                         self.log.emit(
                             f"🧭 Wishlist crawl [{mode}]: {len(seen)} items "
-                            f"across {self._last_crawl_pages} page(s)."
+                            f"across {self._last_crawl_pages} page(s), "
+                            f"cycle {self._crawl_cycle_ms:.0f}ms "
+                            f"(= worst-case ping delay)."
                         )
             except Exception as e:
                 self.log.emit(f"Wishlist crawl error: {e}")
 
             elapsed = time.monotonic() - cycle_start
-            if time.monotonic() < self._wishlist_burst_until:
+            if DP_PRIMARY:
+                # Demoted to a fallback and digest source. Every request
+                # it makes is a request the product pages do not get, so
+                # it idles between sweeps instead of running flat out.
+                await asyncio.sleep(max(1.0, DP_PRIMARY_CRAWL_SECONDS - elapsed))
+            elif time.monotonic() < self._wishlist_burst_until:
                 # A targeted item is one confirming read away — crawl hard
                 # so effective state flips (and the ping fires) fast.
                 await asyncio.sleep(WISHLIST_BURST_SLEEP)
@@ -2521,19 +2940,77 @@ class MonitorWorker(QThread):
                 crawl = self._scan_from_crawl
                 self._scan_errors = 0
                 self._scan_from_crawl = 0
-                rate = scans / SCAN_RATE_LOG_SECONDS
+                dp_att = self._dp_attempts
+                dp_blk = self._dp_blocked
+                self._dp_attempts = 0
+                self._dp_blocked = 0
+
                 tracked = len(self._enabled_products()) or 1
-                cadence = tracked / rate if rate > 0 else float("inf")
                 in_stock = sum(
                     1 for v in self.effective_state.values() if v == "in_stock"
                 )
-                err_pct = (errs / scans * 100) if scans else 0.0
+
+                # Report the DISTRIBUTION of freshness, not a fleet mean.
+                #
+                # The old line divided total scans by product count. That
+                # was actively misleading twice over. A captcha returns in
+                # ~85ms where a real page takes ~1500ms, so a blocked pool
+                # spins the loop faster and scored BETTER. And a mean hides
+                # starvation: 16 items can sit minutes behind while the
+                # average still reads "every 0.9s" because the other 28 are
+                # healthy. That is precisely the state in which pings were
+                # arriving 2-3 minutes late while this line looked great.
+                #
+                # So: report the median product, the worst product, and how
+                # many are genuinely behind. The worst number is the one
+                # that decides whether a drop is caught.
+                now_mono = time.monotonic()
+                ages = sorted(
+                    (now_mono - self._last_good_scan[a], a)
+                    for a in self._enabled_products()
+                    if a in self._last_good_scan
+                )
                 crawl_pct = (crawl / scans * 100) if scans else 0.0
+                err_pct = (errs / scans * 100) if scans else 0.0
+                dp_blk_pct = (dp_blk / dp_att * 100) if dp_att else 0.0
+
+                # NOTE: stats_writer.py scrapes "checked every Xs (Y/s)"
+                # out of this line to feed the public portfolio monitor,
+                # so that fragment has to survive verbatim. It now carries
+                # honest numbers: the MEDIAN product's freshness rather
+                # than a fleet mean, and good scans per second rather than
+                # total attempts.
+                good_rate = max(scans - errs, 0) / SCAN_RATE_LOG_SECONDS
+                gaps = sorted(
+                    self._good_gap[a]
+                    for a in self._enabled_products()
+                    if a in self._good_gap
+                )
+                if ages:
+                    # Typical refresh INTERVAL, not age-since-last-read.
+                    med = gaps[len(gaps) // 2] if gaps else 0.0
+                    worst_age, worst_asin = ages[-1]
+                    behind = sum(
+                        1 for age, _ in ages if age >= STALE_PRODUCT_SECONDS
+                    )
+                    freshness = (
+                        f"checked every {med:.1f}s ({good_rate:.1f}/s) | "
+                        f"worst {worst_age:.0f}s ({worst_asin})"
+                    )
+                    if behind:
+                        freshness += (
+                            f" | ⚠ {behind}/{len(ages)} over "
+                            f"{STALE_PRODUCT_SECONDS:.0f}s behind"
+                        )
+                else:
+                    freshness = f"checked every 0.0s ({good_rate:.1f}/s)"
+
                 self.log.emit(
-                    f"⚡ every product checked every {cadence:.1f}s "
-                    f"({rate:.1f}/s) | {tracked} tracked, {in_stock} in "
-                    f"stock | {crawl_pct:.0f}% from crawl, "
-                    f"{100 - crawl_pct:.0f}% own fetch | {err_pct:.1f}% stale"
+                    f"⚡ {tracked} tracked, {in_stock} in stock | "
+                    f"{freshness} | {crawl_pct:.0f}% crawl, "
+                    f"{100 - crawl_pct:.0f}% own | /dp/ "
+                    f"{dp_att / SCAN_RATE_LOG_SECONDS:.1f}/s, "
+                    f"{dp_blk_pct:.0f}% blocked | {err_pct:.1f}% stale"
                 )
             except Exception as e:
                 self.log.emit(f"Scan-rate log error: {e}")
@@ -2965,9 +3442,14 @@ class MonitorWorker(QThread):
                             f"{WISHLIST_HTTP_STAGGER_SECONDS}s per-proxy stagger. "
                             f"id={wishlist_id}"
                         )
-                        tasks.append(asyncio.create_task(
-                            self.wishlist_http_scanner_forever(proxies)
-                        ))
+                        # Staggered workers so the blind window between
+                        # sweeps is cycle/N rather than a whole cycle.
+                        for _w in range(max(1, WISHLIST_CRAWL_WORKERS)):
+                            tasks.append(asyncio.create_task(
+                                self.wishlist_http_scanner_forever(
+                                    proxies, worker_id=_w
+                                )
+                            ))
                     else:
                         self.log.emit(
                             "Wishlist scanner DISABLED (no wishlist_id in Settings). "
