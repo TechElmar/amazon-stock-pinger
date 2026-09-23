@@ -317,6 +317,28 @@ ROTATING_MAX_CONCURRENT = 60
 # fix, it is the cost of a fresh exit IP, so the timeout has to allow
 # for it.
 ROTATING_TIMEOUT_SECONDS = 12
+
+# HARD CEILING ON /dp/ REQUESTS PER SECOND.
+#
+# Degraded responses come back fast, so they make the scan loops spin
+# faster, which produces more requests, which earns more degradation.
+# Measured on 2026-09-21: /dp/ went from 3.0/s to 11.1/s purely from
+# this feedback, with 95% of responses unusable, while peak concurrency
+# stayed at 6-10 out of a 60 cap. The volume was self-inflicted.
+#
+# Concurrency limits do not stop this: a spiral of FAST failures never
+# needs many simultaneous connections. Only a rate limit does.
+#
+# Healthy steady state was ~3/s, so 4/s leaves headroom without letting
+# a bad patch accelerate into a worse one.
+DP_MAX_PER_SECOND = 4.0
+
+# A page that is a real product page skeleton with the product data
+# stripped out: correct <title>, but no title element, no availability,
+# no price anywhere. Amazon serves these to IP ranges it distrusts. It
+# is a soft block, not an ambiguous page, and must be treated as a
+# failure so the item falls back to crawl data instead of hammering.
+SHELL_PAGE_MAX_BYTES = 600 * 1024
 # How often to emit the coverage log line (the crawl runs many cycles
 # per second; we don't want a log line every cycle).
 WISHLIST_CRAWL_LOG_SECONDS = 30
@@ -602,6 +624,71 @@ def extract_price_number(price_text):
         return None
 
 
+class RateLimiter:
+    """Token bucket capping calls per second across all callers.
+
+    Distinct from a semaphore: a semaphore bounds how many requests run
+    AT ONCE, which does nothing about a flood of fast failures. This
+    bounds how many start per second, which is the thing that actually
+    stops a failure spiral.
+    """
+
+    def __init__(self, per_second: float):
+        self.rate = max(0.1, float(per_second))
+        # Starts EMPTY, not full. A full bucket would let 43 scan loops
+        # all fire at once on startup, and would let a spiral burst
+        # above the cap before pacing kicks in. The cost is one
+        # 1/rate wait on the very first request.
+        self._tokens = 0.0
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
+        self.waited = 0
+
+    async def acquire(self) -> None:
+        # The lock is held across the sleep on purpose: that is what
+        # paces callers instead of letting them all wake together.
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.rate, self._tokens + (now - self._last) * self.rate
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                self.waited += 1
+                await asyncio.sleep((1.0 - self._tokens) / self.rate)
+
+
+def is_shell_page(html: str) -> bool:
+    """True for a product page with the product stripped out.
+
+    Amazon serves these to IP ranges it distrusts: the right <title>,
+    the page furniture, and none of the data. Measured through the
+    rotating gateway, a shell is ~320KB against ~1.3MB for the real
+    thing, and carries no productTitle, no availability block and no
+    price string at all.
+
+    Treated as a soft block rather than an ambiguous page, so the item
+    falls back to crawl data instead of re-fetching forever.
+    """
+    if not html or len(html) > SHELL_PAGE_MAX_BYTES:
+        return False
+    if 'id="productTitle"' in html or 'id="availability"' in html:
+        return False
+    if 'id="outOfStock"' in html:
+        return False        # a real, decisive out-of-stock page
+    # A genuine page always prices itself somewhere.
+    if _RE_ANY_PRICE.search(html):
+        return False
+    # Only call it a shell if it really is a product page shell.
+    return "dp-container" in html or "buybox" in html
+
+
+_RE_ANY_PRICE = re.compile(r"\$[0-9,]+\.[0-9]{2}")
+
+
 def load_rotating_proxies() -> List[str]:
     """Load the optional rotating-gateway pool.
 
@@ -695,6 +782,11 @@ class HTTPAmazonChecker:
     def __init__(self, amazon_domain: str, semaphore: asyncio.Semaphore):
         self.amazon_domain = amazon_domain.rstrip("/")
         self.semaphore = semaphore
+        # Caps /dp/ STARTS per second across every caller. The semaphore
+        # above bounds how many run at once, which does nothing to stop a
+        # flood of fast failures; only a rate limit does. See
+        # DP_MAX_PER_SECOND.
+        self.rate_limiter = RateLimiter(DP_MAX_PER_SECOND)
 
     def product_url(self, asin: str) -> str:
         return f"{self.amazon_domain}/dp/{asin}"
@@ -963,6 +1055,11 @@ class HTTPAmazonChecker:
                 "Range": "bytes=0-150000",
             }
 
+        # Pace every /dp/ start, whatever the caller. This is the brake
+        # on the failure spiral: degraded responses return fast, which
+        # would otherwise let the scan loops accelerate into more of them.
+        await self.rate_limiter.acquire()
+
         async with self.semaphore:
             try:
                 r = await session.get(
@@ -982,6 +1079,15 @@ class HTTPAmazonChecker:
                 head_lower = html[:CAPTCHA_SCAN_BYTES].lower()
                 if "captcha" in head_lower or "robot check" in head_lower:
                     return self.empty_result(asin, "Blocked/Captcha", proxy_label)
+
+                # A stripped page shell is a soft block, not an ambiguous
+                # page. Reporting it as "Unknown" meant the item never
+                # resolved and re-fetched forever, which is what drove
+                # /dp/ from 3/s to 11/s. Naming it a block makes it an
+                # error result, so the item falls back to crawl data and
+                # stops hammering.
+                if is_shell_page(html):
+                    return self.empty_result(asin, "Blocked/Shell", proxy_label)
 
                 # Decide cheaply whether this page could ping at all. A
                 # page with no buy box, or a definitive out-of-stock,
