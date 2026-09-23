@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -200,20 +201,6 @@ WISHLIST_CYCLE_SECONDS = 0.5
 # genuinely back-to-back rather than idling between sweeps.
 WISHLIST_CYCLE_MIN_SLEEP = 0.05
 
-# PIPELINED CRAWL WORKERS.
-#
-# One worker must finish a whole sweep before starting the next, so an
-# item that restocks just after its page was read waits a full ~1.5s
-# cycle to be noticed. Running several staggered workers shortens that
-# blind window to roughly cycle/N without making any single sweep
-# faster: worker 1 reads at t=0, worker 2 at t=0.5, worker 3 at t=1.0.
-#
-# This is affordable precisely because it is the WISHLIST. That endpoint
-# is built to be shared publicly and is far less defended than /dp/:
-# measured ~3 req/s at essentially no block rate, where /dp/ was 67%
-# blocked at 11.7 req/s. Three workers is ~9 req/s of wishlist traffic.
-WISHLIST_CRAWL_WORKERS = 1
-
 # BURST-CONFIRM: the instant a targeted, armed item first reads in stock
 # at/below its target, the crawler drops into a short high-rate window so
 # the SECOND (confirming) read lands in a fraction of a second instead of
@@ -272,24 +259,11 @@ WISHLIST_REDISCOVER_SECONDS = 300
 # 100ms polling immediately.
 DP_BACKOFF_SECONDS = 2.0
 
-# PRODUCT-PAGE-PRIMARY MODE.
-#
-# When True every product reads its OWN /dp/ page on every scan, and the
-# wishlist crawl is demoted to exactly what it should be: a fallback for
-# when a product fetch is hard-blocked, plus the digest source.
-#
-# The wishlist is one request for ten products, which is why it was the
-# primary path. But it renders ONE offer per row, and that row is not
-# always the buy box: during the B0H78BB9TY drop the crawl alternated
-# $299.99 and $89.99 on successive reads. It also carries no price or
-# stock at all for 16 of the 44 tracked items.
-#
-# The cost is request volume: 44 products on a ~1.5s fetch is ~29 req/s
-# spread over the pool. Whether that is sustainable is a measured
-# question, not a theoretical one, so DP_PRIMARY_INTERVAL throttles it
-# and the heartbeat reports "/dp/ N/s, X% blocked" to show the answer.
-# Set DP_PRIMARY = False to fall straight back to crawl-primary.
-DP_PRIMARY = False
+# A product whose last trustworthy reading is older than this is flagged
+# in the heartbeat. Sized well above the crawl-blind backoff so a normal
+# backed-off item does not trip it, but low enough that a genuinely
+# neglected product shows up long before a drop is missed.
+STALE_PRODUCT_SECONDS = 20.0
 
 # ROTATING-GATEWAY POOL (second, optional proxy pool).
 #
@@ -300,9 +274,9 @@ DP_PRIMARY = False
 #      whole pool, and reusing it is correct rather than a mistake.
 #   2. Cooldown. evaluate_proxy_cooldown benches a proxy by host:port
 #      after a run of blocks. Every rotated exit shares ONE host:port, so
-#      a few blocked exits would bench the ENTIRE pool for 15 minutes.
-#      Rotating entries are therefore exempt: a block on one exit says
-#      nothing about the next, which is the whole point of rotation.
+#      a few blocked exits would bench the ENTIRE pool. Rotating entries
+#      are therefore exempt: a block on one exit says nothing about the
+#      next, which is the whole point of rotation.
 #
 # File format matches proxies.txt (host:port:user:pass). Absent or empty
 # means nothing changes and the bot behaves exactly as it does today.
@@ -313,32 +287,6 @@ ROTATING_PROXY_FILE = "proxies_rotating.txt"
 # the confirm numbers look good.
 ROTATING_FOR_CONFIRM = True
 ROTATING_FOR_MONITOR = False
-
-# Sleep between a product's own fetches in DP_PRIMARY mode.
-#
-# This CANNOT be 0. A successful fetch takes ~1.5s, but a blocked one
-# comes back in ~85ms, so with no floor the loop spins ~12x faster
-# exactly when Amazon is refusing us: 44 products would generate ~500
-# req/s and destroy the pool in seconds. Measured in test at 101,188
-# iterations per second against an instant-returning stub.
-#
-# Healthy: 44 / (1.5 + 0.75) = ~20 req/s.
-DP_PRIMARY_INTERVAL = 0.75
-
-# Backoff after a BLOCKED fetch. This is what bounds the failure spiral:
-# if every fetch is blocked, 44 / (0.1 + 3.0) = ~14 req/s, so the pool
-# gets quieter under pressure instead of louder.
-DP_PRIMARY_BLOCKED_INTERVAL = 3.0
-
-# Crawl cycle while demoted to fallback duty. Slow, because every
-# wishlist request is one the product pages do not get.
-DP_PRIMARY_CRAWL_SECONDS = 15.0
-
-# A product whose last trustworthy reading is older than this is flagged
-# in the heartbeat. Sized well above the crawl-blind backoff so a normal
-# backed-off item does not trip it, but low enough that a genuinely
-# neglected product shows up long before a drop is missed.
-STALE_PRODUCT_SECONDS = 20.0
 # How often to emit the coverage log line (the crawl runs many cycles
 # per second; we don't want a log line every cycle).
 WISHLIST_CRAWL_LOG_SECONDS = 30
@@ -968,7 +916,20 @@ class HTTPAmazonChecker:
                 head = html[:PARSE_HTML_MAX_BYTES]
                 stock, price, title = cheap_verdict(head)
                 if stock in ("In stock", "Pre-order"):
-                    return self.parse_html(asin, html, proxy_label)
+                    # OFF THE EVENT LOOP. Measured at 1034ms on the live
+                    # box, and asyncio runs everything on one thread, so
+                    # calling it directly froze every other product for a
+                    # full second. That showed up in the heartbeat as
+                    # sudden stalls ("checked every 7.3s", 5 products
+                    # over 20s behind) and it hit hardest during a drop,
+                    # when several pages become pingable at once.
+                    #
+                    # lxml releases the GIL while it parses, and the
+                    # interpreter switches threads during the rest, so
+                    # the loop keeps serving other scans throughout.
+                    return await asyncio.to_thread(
+                        self.parse_html, asin, html, proxy_label
+                    )
 
                 return {
                     "asin": asin,
@@ -1956,6 +1917,109 @@ class MonitorWorker(QThread):
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
+    def _is_rotating(self, proxy: Optional[str]) -> bool:
+        """True when this proxy is a rotating gateway rather than a
+        fixed IP."""
+        if not proxy:
+            return False
+        return proxy_label_from_url(proxy) in self._rotating_labels
+
+    @asynccontextmanager
+    async def _session_for(self, proxy: Optional[str]):
+        """Yield the HTTP session this proxy needs.
+
+        THE WHOLE POINT: a rotating gateway hands out a new exit IP per
+        TCP CONNECTION, not per HTTP request. Reusing the shared session
+        therefore pins every request to a single exit, which Amazon
+        throttles after about two requests, returning degraded ~310KB
+        pages that are NOT captchas and so read as "product not found".
+
+        Measured against the live gateway:
+            shared session : 1 exit IP over 6 requests, then throttled
+            fresh session  : 5 distinct /64s in 5 requests, 10/10 pages
+
+        A fixed proxy is the opposite: reusing the warm connection saves
+        a TLS handshake (~1.5s vs ~2.1s), so it keeps the shared session.
+        """
+        if self._is_rotating(proxy):
+            session = AsyncSession(
+                impersonate=STATIC_IMPERSONATE_PROFILE,
+                max_clients=1,
+            )
+            await session.__aenter__()
+            try:
+                yield session
+            finally:
+                try:
+                    await session.__aexit__(None, None, None)
+                except Exception:
+                    pass
+        else:
+            yield self.scan_session
+
+    async def _scan_once(
+        self,
+        checker,
+        asin: str,
+        proxies: List[Optional[str]],
+        idx: int,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], int]:
+        """One product read, with the session semantics the pool needs.
+
+        Mirrors check_product_single's contract so the scan loop does not
+        care which pool is in use. On a rotating gateway the "retry with
+        the next proxy" idea becomes "retry on a fresh connection", which
+        is strictly better: the retry lands on a different exit IP.
+        """
+        rotating = [p for p in (self.rotating_proxies or []) if p]
+        if not (ROTATING_FOR_MONITOR and rotating):
+            return await checker.check_product_single(
+                self.scan_session, asin, proxies,
+                self.is_proxy_available, idx,
+            )
+
+        proxy = rotating[0]
+        raw: List[Dict[str, Any]] = []
+        for _attempt in range(2):
+            async with self._session_for(proxy) as session:
+                r = await checker.fetch_product(session, asin, proxy)
+            raw.append(r)
+            if not self._is_error_result(r):
+                return r, raw, idx
+        return raw[-1], raw, idx
+
+    async def _confirm_via_rotating(self, asin: str) -> Optional[dict]:
+        """One /dp/ read through the rotating gateway, on its OWN session.
+
+        The gateway rotates per TCP CONNECTION, not per HTTP request,
+        despite advertising the latter. Measured against it directly:
+
+          reusing one session : 1 exit IP across 6 requests, and Amazon
+                                throttled it after ~2, returning degraded
+                                310KB pages that are NOT captchas and so
+                                would look like "product not found"
+          fresh session each  : 5 distinct /64 prefixes in 5 requests,
+                                and 10/10 real product pages where the
+                                datacenter pool scored 0/10
+
+        So this deliberately does NOT reuse self.scan_session. It opens a
+        short-lived session, makes one request, and closes it. That costs
+        a TLS handshake (~2.1s vs ~1.5s warm) which is irrelevant here:
+        confirms are a few dozen a day, and this is the read that decides
+        whether thousands of people get pinged.
+
+        Returns None on any failure, which the caller treats as "say
+        nothing" — the crawl's next cycle is still coming, so this can
+        only ever ADD a chance to fire early.
+        """
+        proxy = self.rotating_proxies[0]
+        try:
+            async with self._session_for(proxy) as session:
+                return await self.checker.fetch_product(session, asin, proxy)
+        except Exception as e:
+            self.log.emit(f"Rotating confirm failed {asin}: {e}")
+            return None
+
     async def _instant_confirm(self, asin: str) -> None:
         """Race this product's /dp/ page across several proxies and feed
         the first real answer straight into the ping gate.
@@ -1965,26 +2029,25 @@ class MonitorWorker(QThread):
         price, not a wishlist row that may be showing some other offer.
         """
         try:
-            # Prefer the rotating pool for the confirm when we have one.
-            # This is the single request that decides whether thousands of
-            # people get pinged, so it is worth spending the best IPs we
-            # have on it: a fresh exit per request is the hardest thing
-            # for Amazon to rate-limit.
             if ROTATING_FOR_CONFIRM and self.rotating_proxies:
-                proxies = list(self.rotating_proxies)
+                result = await self._confirm_via_rotating(asin)
+                if result is None:
+                    return
             else:
                 proxies = self.scan_proxies or [None]
-            key = f"__confirm_{asin}"
-            idx = self.proxy_indexes.get(key, 0)
-            result, _raw, next_idx = await self.checker.check_product_parallel(
-                self.scan_session,
-                asin,
-                proxies,
-                self.is_proxy_available,
-                idx,
-                n_parallel=CURSED_PARALLEL_PROXIES,
-            )
-            self.proxy_indexes[key] = next_idx
+                key = f"__confirm_{asin}"
+                idx = self.proxy_indexes.get(key, 0)
+                result, _raw, next_idx = (
+                    await self.checker.check_product_parallel(
+                        self.scan_session,
+                        asin,
+                        proxies,
+                        self.is_proxy_available,
+                        idx,
+                        n_parallel=CURSED_PARALLEL_PROXIES,
+                    )
+                )
+                self.proxy_indexes[key] = next_idx
 
             if self._is_error_result(result):
                 # Blocked or timed out. Say nothing: the crawl's own next
@@ -2039,14 +2102,28 @@ class MonitorWorker(QThread):
             key = f"__verify_{asin}"
             idx = self.proxy_indexes.get(key, 0)
 
-            result, _raw, next_idx = await self.checker.check_product_parallel(
-                self.scan_session,
-                asin,
-                proxies,
-                self.is_proxy_available,
-                idx,
-                n_parallel=CURSED_PARALLEL_PROXIES,
-            )
+            if self._is_rotating(proxies[0] if proxies else None):
+                # Racing several requests down ONE gateway is pointless:
+                # they would share a connection and therefore an exit IP.
+                # A single fresh connection is both simpler and the only
+                # thing that actually rotates.
+                proxy = proxies[0]
+                async with self._session_for(proxy) as session:
+                    result = await self.checker.fetch_product(
+                        session, asin, proxy
+                    )
+                next_idx = idx
+            else:
+                result, _raw, next_idx = (
+                    await self.checker.check_product_parallel(
+                        self.scan_session,
+                        asin,
+                        proxies,
+                        self.is_proxy_available,
+                        idx,
+                        n_parallel=CURSED_PARALLEL_PROXIES,
+                    )
+                )
             self.proxy_indexes[key] = next_idx
             seller = clean(result.get("seller") or "")
             prev_entry = self.seller_cache.get(asin) or {}
@@ -2483,9 +2560,6 @@ class MonitorWorker(QThread):
         burst_until = 0.0
 
         while self.running:
-            # Set inside the scan when Amazon refuses the fetch; drives the
-            # backoff below so a blocked pool gets quieter, not louder.
-            was_blocked = False
             try:
                 # FRESHNESS-GATED SOURCE SELECTION.
                 #
@@ -2504,8 +2578,7 @@ class MonitorWorker(QThread):
                 # case, and no product can go stale unnoticed.
                 seen = self._wishlist_seen.get(asin)
                 fresh = (
-                    not DP_PRIMARY
-                    and seen is not None
+                    seen is not None
                     and (time.monotonic() - seen[1]) <= WISHLIST_FRESH_SECONDS
                     # Fresh is not enough: the reading has to SAY something.
                     # Some items (unreleased ones especially) render on the
@@ -2541,14 +2614,8 @@ class MonitorWorker(QThread):
                             )
                         )
                     else:
-                        result, raw_results, new_idx = (
-                            await checker.check_product_single(
-                                self.scan_session,
-                                asin,
-                                proxies,
-                                self.is_proxy_available,
-                                idx,
-                            )
+                        result, raw_results, new_idx = await self._scan_once(
+                            checker, asin, proxies, idx
                         )
                     self.proxy_indexes[asin] = new_idx
                     proxy_source = result.get("source", "direct")
@@ -2560,7 +2627,6 @@ class MonitorWorker(QThread):
                     self._dp_attempts += 1
                     if "blocked" in (result.get("stock") or "").lower():
                         self._dp_blocked += 1
-                        was_blocked = True
 
                     for r in raw_results:
                         src = r.get("source", "direct")
@@ -2685,18 +2751,7 @@ class MonitorWorker(QThread):
             except Exception as e:
                 self.log.emit(f"ERROR {asin}: {e}")
 
-            if DP_PRIMARY:
-                # Straight back to the product page. No crawl-blind
-                # backoff here: in this mode /dp/ IS the detector, so
-                # backing it off would be backing off the only thing
-                # that can see a restock. But a BLOCKED fetch returns in
-                # ~85ms, so without the longer backoff the loop would
-                # accelerate under refusal instead of yielding.
-                await asyncio.sleep(
-                    DP_PRIMARY_BLOCKED_INTERVAL if was_blocked
-                    else DP_PRIMARY_INTERVAL
-                )
-            elif time.monotonic() < burst_until:
+            if time.monotonic() < burst_until:
                 await asyncio.sleep(0.1)
             elif asin in self.cursed_asins:
                 await asyncio.sleep(CURSED_SCAN_INTERVAL)
@@ -2730,15 +2785,7 @@ class MonitorWorker(QThread):
         if not results:
             return
 
-        # In product-page-primary mode the crawl must NOT drive the ping
-        # gate. Its rows carry one offer each, not necessarily the buy
-        # box, so letting it advance the hysteresis counters would feed
-        # the exact flapping readings we are trying to stop trusting.
-        # It still merges into _wishlist_seen below, which keeps it
-        # available as the fallback when a product fetch is blocked.
-        if DP_PRIMARY:
-            pass
-        elif self.notifier is not None and self.discord_session is not None:
+        if self.notifier is not None and self.discord_session is not None:
             # Cached enabled-products snapshot (5s TTL) — this method
             # runs on every wishlist probe (~13x/sec); a fresh SQLite
             # query each time was pure waste.
@@ -2809,13 +2856,17 @@ class MonitorWorker(QThread):
             headers["Sec-Fetch-User"] = "?1"
             headers["Upgrade-Insecure-Requests"] = "1"
         try:
-            r = await self.scan_session.get(
-                url,
-                headers=headers,
-                proxy=proxy,
-                timeout=HTTP_TIMEOUT_SECONDS + 4,
-                allow_redirects=True,
-            )
+            # A rotating gateway needs its own connection per request or
+            # every page of the crawl comes from the same exit IP, which
+            # Amazon throttles within a couple of requests.
+            async with self._session_for(proxy) as session:
+                r = await session.get(
+                    url,
+                    headers=headers,
+                    proxy=proxy,
+                    timeout=HTTP_TIMEOUT_SECONDS + 4,
+                    allow_redirects=True,
+                )
             if r.status_code >= 400:
                 return {}, f"HTTP {r.status_code}", ""
             html = r.text or ""
@@ -2838,7 +2889,6 @@ class MonitorWorker(QThread):
     async def wishlist_http_scanner_forever(
         self,
         proxies: List[Optional[str]],
-        worker_id: int = 0,
     ) -> None:
         """Paginated HTTP wishlist crawler — the primary stock detector.
 
@@ -2864,17 +2914,14 @@ class MonitorWorker(QThread):
         if not rotation:
             rotation = [None]
 
-        if worker_id == 0:
-            self.log.emit(
-                f"HTTP wishlist crawler launching: {len(rotation)} proxies, "
-                f"{WISHLIST_CRAWL_WORKERS} staggered worker(s), paginated "
-                f"full-list walk (up to {WISHLIST_MAX_PAGES} pages/cycle)."
-            )
+        self.log.emit(
+            f"HTTP wishlist crawler launching: {len(rotation)} proxies, "
+            f"paginated full-list walk (up to {WISHLIST_MAX_PAGES} "
+            f"pages/cycle)."
+        )
 
         domain = self.wishlist_scanner.amazon_domain
-        # Start each worker on a different proxy so simultaneous sweeps do
-        # not queue up behind the same IP.
-        proxy_idx = worker_id * max(1, len(rotation) // max(1, WISHLIST_CRAWL_WORKERS))
+        proxy_idx = 0
 
         def next_proxy() -> Optional[str]:
             nonlocal proxy_idx
@@ -2940,34 +2987,14 @@ class MonitorWorker(QThread):
 
         last_discovery = 0.0
 
-        # Stagger this worker into its slot so the workers land evenly
-        # across the cycle rather than all sweeping at the same instant.
-        if worker_id:
-            await asyncio.sleep(
-                (WISHLIST_CYCLE_SECONDS * worker_id)
-                / max(1, WISHLIST_CRAWL_WORKERS)
-            )
 
         while self.running:
             cycle_start = time.monotonic()
             try:
-                # Only worker 0 owns the sequential re-walk. It is ~18s
-                # and it establishes the shared page-URL chain, so having
-                # every worker do it would multiply the slowest operation
-                # in the system for no extra coverage.
                 need_discovery = (
-                    worker_id == 0
-                    and (
-                        not self._wl_page_urls
-                        or cycle_start - last_discovery
-                        >= WISHLIST_REDISCOVER_SECONDS
-                    )
+                    not self._wl_page_urls
+                    or cycle_start - last_discovery >= WISHLIST_REDISCOVER_SECONDS
                 )
-                if worker_id and not self._wl_page_urls:
-                    # Chain not built yet: wait for worker 0 rather than
-                    # racing it with a second sequential walk.
-                    await asyncio.sleep(0.5)
-                    continue
                 if need_discovery:
                     page_urls, seen = await discover()
                     if page_urls:
@@ -3012,12 +3039,7 @@ class MonitorWorker(QThread):
                 self.log.emit(f"Wishlist crawl error: {e}")
 
             elapsed = time.monotonic() - cycle_start
-            if DP_PRIMARY:
-                # Demoted to a fallback and digest source. Every request
-                # it makes is a request the product pages do not get, so
-                # it idles between sweeps instead of running flat out.
-                await asyncio.sleep(max(1.0, DP_PRIMARY_CRAWL_SECONDS - elapsed))
-            elif time.monotonic() < self._wishlist_burst_until:
+            if time.monotonic() < self._wishlist_burst_until:
                 # A targeted item is one confirming read away — crawl hard
                 # so effective state flips (and the ping fires) fast.
                 await asyncio.sleep(WISHLIST_BURST_SLEEP)
@@ -3603,14 +3625,9 @@ class MonitorWorker(QThread):
                             f"{WISHLIST_HTTP_STAGGER_SECONDS}s per-proxy stagger. "
                             f"id={wishlist_id}"
                         )
-                        # Staggered workers so the blind window between
-                        # sweeps is cycle/N rather than a whole cycle.
-                        for _w in range(max(1, WISHLIST_CRAWL_WORKERS)):
-                            tasks.append(asyncio.create_task(
-                                self.wishlist_http_scanner_forever(
-                                    proxies, worker_id=_w
-                                )
-                            ))
+                        tasks.append(asyncio.create_task(
+                            self.wishlist_http_scanner_forever(proxies)
+                        ))
                     else:
                         self.log.emit(
                             "Wishlist scanner DISABLED (no wishlist_id in Settings). "
