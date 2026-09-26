@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 from PySide6.QtCore import QThread, Signal
 
 from notifier import DiscordNotifier
+from database import ANY_PRICE_TARGET
 
 # lxml parses Amazon's ~0.5MB HTML 5-10x faster than the pure-Python
 # html.parser. At wishlist fan-out rates (~13 parses/sec) that's the
@@ -1641,6 +1642,9 @@ class MonitorWorker(QThread):
         # (asin, seller_class) pairs already reported as gate-held, so a
         # held item says so once per state rather than every scan.
         self._gate_logged: set = set()
+        # (asin, seller_class) pairs already reported as having skipped
+        # the seller check on price, so it is said once, not every scan.
+        self._price_override_logged: set = set()
         self._warm_log_at: float = 0.0
         self.effective_state: Dict[str, Optional[str]] = {}
 
@@ -2004,10 +2008,12 @@ class MonitorWorker(QThread):
             self.log.emit(f"DB save_alert_state error: {e}")
         self.log.emit(f"🔫 {asin} alert latch: {prev} → {state}")
 
-    def _categorize(self, asin: str, result: dict) -> str:
+    def _categorize(self, asin: str, result: dict,
+                    target: float = 0.0) -> str:
         """Categorize a scan result into the state-machine observation:
 
-            "in_stock" — definitively in stock AND sold by Amazon
+            "in_stock" — definitively in stock, and either sold by
+                         Amazon or priced at/below `target`
             "oos"      — definitively out of stock, OR in stock but
                          held by a third-party seller. From the ping
                          perspective these are the same thing: Amazon
@@ -2049,7 +2055,36 @@ class MonitorWorker(QThread):
         ):
             return "unknown"
 
-        # In stock — now the AMAZON-SELLER gate.
+        # In stock. PRICE BEATS SELLER.
+        #
+        # The seller gate exists to stop a reseller's inflated buy-box
+        # price reading as a drop. It cannot do that job when the price
+        # is already at or below a target set by hand: at that price the
+        # listing is worth announcing whoever is shipping it.
+        #
+        # Meanwhile the gate's own failure mode is total silence.
+        # B0H78BB9TY sat in stock at exactly its $89.99 target from
+        # 21:19 to 00:16 and never pinged, because 25 of 43 products
+        # have no resolved seller and the /dp/ merchant read fails most
+        # often during a drop, the one moment it has to work.
+        #
+        # ANY-price items are excluded on purpose: they carry the
+        # sentinel target, so "at or below target" is true of every
+        # price and would mean nothing. They keep the seller gate.
+        if 0 < target < ANY_PRICE_TARGET and result["price_number"] <= target:
+            sclass = self._resolve_seller(asin, result)
+            if sclass != "amazon":
+                key = (asin, sclass)
+                if key not in self._price_override_logged:
+                    self._price_override_logged.add(key)
+                    self.log.emit(
+                        f"💰 {asin} at {result.get('price')} is at or under "
+                        f"the ${target:.2f} target, so the seller check is "
+                        f"skipped (seller is {sclass!r})."
+                    )
+            return "in_stock"
+
+        # Above target, or no target to judge by — the AMAZON-SELLER gate.
         sclass = self._resolve_seller(asin, result)
         if sclass == "amazon":
             return "in_stock"
@@ -2593,7 +2628,7 @@ class MonitorWorker(QThread):
         (stock state feeds the daily digest), so it must be called for
         digest-only items too.
         """
-        observation = self._categorize(asin, result)
+        observation = self._categorize(asin, result, target)
 
         # THE SILENT GATE.
         #
@@ -3129,7 +3164,9 @@ class MonitorWorker(QThread):
                 # Burst mode trigger — uses raw observation, not the
                 # hysteresis-confirmed effective state, so a single
                 # OOS → in_stock flip fires burst mode immediately.
-                obs_category = self._categorize(asin, result)
+                obs_category = self._categorize(
+                    asin, result, float(product.get("target_price") or 0)
+                )
                 is_real_in_stock = obs_category == "in_stock"
                 if last_stock_oos and is_real_in_stock:
                     burst_until = time.monotonic() + 30
