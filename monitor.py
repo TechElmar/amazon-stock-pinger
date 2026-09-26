@@ -266,6 +266,38 @@ DP_BACKOFF_SECONDS = 2.0
 # neglected product shows up long before a drop is missed.
 STALE_PRODUCT_SECONDS = 20.0
 
+# WHAT A PING IS ALLOWED TO FIRE ON.
+#
+# One rule: the price is at or under target AND we have seen a real
+# Add-to-Cart / Buy-Now / Pre-order control on the product page at that
+# price. Who is selling it does not enter into it.
+#
+# This replaces the Amazon-seller gate, which asked a question Amazon
+# does not reliably answer. Probed directly, a 30th Celebration product
+# page came back with the real title, a buy box and an add-to-cart
+# button, and zero occurrences of "Sold by" anywhere in the HTML. Four
+# of five held items never resolved a seller once in 30 hours, so the
+# gate held them forever: 23 real drops, 146 minutes of buyable time,
+# no pings.
+#
+# A cart button is better evidence anyway. It is the thing that decides
+# whether you can actually buy it, and unlike a wishlist row it cannot
+# be showing some other offer.
+REQUIRE_BUY_CONTROL = True
+
+# But confirmation must never become the new silence. The crawl sees an
+# item at target from a wishlist row, which has no cart button to read,
+# so the product page has to be fetched to confirm. If that fetch keeps
+# failing (it is blocked 7-16% of the time and worst during a drop) the
+# bot would sit on a real drop saying nothing, which is the exact bug
+# just fixed wearing a different hat.
+#
+# So: prefer button-confirmed evidence, and if it cannot be had within
+# this many seconds of the item first appearing at target, fire on the
+# crawl evidence and say in the log which evidence was used. Missing a
+# drop is the only unrecoverable error here.
+BUY_CONFIRM_GRACE_SECONDS = 25.0
+
 # ROTATING-GATEWAY POOL (second, optional proxy pool).
 #
 # A rotating provider is ONE endpoint that hands out a different exit IP
@@ -1022,6 +1054,12 @@ class HTTPAmazonChecker:
             "source": proxy_label,
             "image_url": image_url,
             "seller": seller,
+            # A REAL buy control was on the page, at a real price. This
+            # is the strongest evidence the bot can get that the item is
+            # actually purchasable right now, and it is what a ping is
+            # allowed to fire on. Only the product page can set it: a
+            # wishlist row has no cart button to look at.
+            "buyable": bool(has_buyable_button and price),
         }
 
     async def fetch_product(
@@ -1168,6 +1206,7 @@ class HTTPAmazonChecker:
             "source": proxy_label,
             "image_url": "",
             "seller": "",
+            "buyable": False,
         }
 
     async def check_product_single(
@@ -1474,6 +1513,12 @@ class WishlistScanner:
                 "source": "wishlist",
                 "image_url": image_url,
                 "seller": seller,
+                # A wishlist row has no Add-to-Cart control to inspect —
+                # it says "In stock" on the strength of a price alone,
+                # and the price it shows is not always the buy box. So
+                # the crawl finds candidates; the product page confirms
+                # them. Never claim buyability we did not see.
+                "buyable": False,
             }
 
         return results
@@ -1645,6 +1690,10 @@ class MonitorWorker(QThread):
         # (asin, seller_class) pairs already reported as having skipped
         # the seller check on price, so it is said once, not every scan.
         self._price_override_logged: set = set()
+        # When each ASIN was first seen at target without a confirmed
+        # cart button, so the confirm grace period can expire.
+        self._at_target_since: Dict[str, float] = {}
+        self._unconfirmed_logged: set = set()
         self._warm_log_at: float = 0.0
         self.effective_state: Dict[str, Optional[str]] = {}
 
@@ -2055,36 +2104,42 @@ class MonitorWorker(QThread):
         ):
             return "unknown"
 
-        # In stock. PRICE BEATS SELLER.
+        # In stock. AT TARGET + A REAL BUY CONTROL = PING.
         #
-        # The seller gate exists to stop a reseller's inflated buy-box
-        # price reading as a drop. It cannot do that job when the price
-        # is already at or below a target set by hand: at that price the
-        # listing is worth announcing whoever is shipping it.
-        #
-        # Meanwhile the gate's own failure mode is total silence.
-        # B0H78BB9TY sat in stock at exactly its $89.99 target from
-        # 21:19 to 00:16 and never pinged, because 25 of 43 products
-        # have no resolved seller and the /dp/ merchant read fails most
-        # often during a drop, the one moment it has to work.
-        #
-        # ANY-price items are excluded on purpose: they carry the
-        # sentinel target, so "at or below target" is true of every
-        # price and would mean nothing. They keep the seller gate.
-        if 0 < target < ANY_PRICE_TARGET and result["price_number"] <= target:
-            sclass = self._resolve_seller(asin, result)
-            if sclass != "amazon":
-                key = (asin, sclass)
-                if key not in self._price_override_logged:
-                    self._price_override_logged.add(key)
-                    self.log.emit(
-                        f"💰 {asin} at {result.get('price')} is at or under "
-                        f"the ${target:.2f} target, so the seller check is "
-                        f"skipped (seller is {sclass!r})."
-                    )
+        # The seller does not enter into it. See REQUIRE_BUY_CONTROL.
+        if target and result["price_number"] <= target:
+            if not REQUIRE_BUY_CONTROL or result.get("buyable"):
+                self._at_target_since.pop(asin, None)
+                return "in_stock"
+
+            # At target, but this read cannot see a cart button — it came
+            # from a wishlist row. Go and look at the product page.
+            first = self._at_target_since.setdefault(asin, time.monotonic())
+            waited = time.monotonic() - first
+            if waited < BUY_CONFIRM_GRACE_SECONDS:
+                self._request_instant_confirm(asin)
+                return "unknown"
+
+            # Grace expired and no product page would confirm it. Fire on
+            # the crawl evidence rather than sit on a real drop, and be
+            # explicit that this one is unconfirmed.
+            if asin not in self._unconfirmed_logged:
+                self._unconfirmed_logged.add(asin)
+                self.log.emit(
+                    f"⚠️ {asin} at {result.get('price')} has been at target "
+                    f"for {waited:.0f}s and the product page will not "
+                    f"confirm a cart button. Announcing on the crawl read "
+                    f"instead of holding it."
+                )
             return "in_stock"
 
-        # Above target, or no target to judge by — the AMAZON-SELLER gate.
+        self._at_target_since.pop(asin, None)
+
+        # Above target, or no target at all. Nothing here can ping (the
+        # price check in _should_alert refuses it), so this only feeds
+        # stock state and the digest. Seller still informs THAT: an item
+        # only a reseller has is, for restock purposes, one Amazon does
+        # not have.
         sclass = self._resolve_seller(asin, result)
         if sclass == "amazon":
             return "in_stock"
@@ -2343,26 +2398,28 @@ class MonitorWorker(QThread):
             self._confirming.discard(asin)
 
     async def seller_warmer_forever(self) -> None:
-        """Resolve sellers BEFORE a drop, not during one.
+        """Keep the seller cache warm, at the lowest possible priority.
 
-        The gate needs a confirmed Amazon seller. Resolving that at drop
-        time is the worst possible moment: /dp/ is most degraded exactly
-        when everyone is hammering Amazon, and every second counts.
+        The seller no longer gates a ping — price plus a real cart button
+        decides that now. What it still feeds is stock state and the
+        digest: an item only a reseller has is, for restock purposes, one
+        Amazon does not have.
 
-        Measured 2026-09-23: only 21 of 43 tracked products had ever had
-        a seller resolved, so the other 22 could not ping at all no
-        matter how in stock they were. Two confirmed drops were lost to
-        this.
-
-        Sellers change rarely, and there is spare /dp/ budget when
-        nothing is dropping, so walk the watchlist continuously and keep
-        the cache warm. Deliberately slow: this is background work and
-        must never compete with a live drop.
+        That makes this strictly background work, and it now yields to
+        drop-time traffic. A cart-button confirmation is on the critical
+        path of an actual ping and shares the same /dp/ rate budget, so
+        the warmer stands down entirely while any confirm is in flight.
+        Measured headroom is only about 1.1-1.5 requests/second over the
+        steady-state /dp/ rate, and a simultaneous multi-item drop can
+        eat all of it.
         """
         while self.running:
             try:
                 await asyncio.sleep(SELLER_WARM_INTERVAL)
                 if self.checker is None or self.scan_session is None:
+                    continue
+                # A live confirmation outranks warming, every time.
+                if self._confirming:
                     continue
 
                 products = self._enabled_products() or {}
@@ -2502,7 +2559,7 @@ class MonitorWorker(QThread):
             self._verifying.discard(asin)
 
     def _observe(
-        self, asin: str, observation: str
+        self, asin: str, observation: str, authoritative: bool = False
     ) -> Tuple[Optional[str], Optional[str], Optional[float]]:
         """Apply one observation to the hysteresis counters and return
         (previous_effective_state, new_effective_state, ended_oos_secs).
@@ -2526,6 +2583,20 @@ class MonitorWorker(QThread):
         if observation == "in_stock":
             self.consec_in_stock[asin] = self.consec_in_stock.get(asin, 0) + 1
             self.consec_oos[asin] = 0
+            # AN AUTHORITATIVE READ NEEDS NO SECOND OPINION.
+            #
+            # The two-read confirm exists because a wishlist row is weak
+            # evidence: it shows one offer, not necessarily the buy box,
+            # and it says "in stock" on the strength of a price alone. A
+            # product-page read carrying a real Add-to-Cart control at a
+            # price at target is not weak evidence — it is the thing the
+            # confirm was trying to approximate. Making it wait for a
+            # second read just spends seconds of a drop re-proving what
+            # it already established.
+            if authoritative:
+                self.consec_in_stock[asin] = max(
+                    self.consec_in_stock[asin], IN_STOCK_CONFIRM_SCANS
+                )
         elif observation == "oos":
             self.consec_oos[asin] = self.consec_oos.get(asin, 0) + 1
             # A run can START as a seller swap and later become a genuine
@@ -2630,15 +2701,14 @@ class MonitorWorker(QThread):
         """
         observation = self._categorize(asin, result, target)
 
-        # THE SILENT GATE.
+        # NOTHING GETS HELD IN SILENCE.
         #
-        # An item can be in stock at a real price and still never ping,
-        # because the seller could not be confirmed as Amazon. That state
-        # used to log NOTHING, so it ran for days unnoticed:
-        # B0H7FDBNSB sat in stock at $16.99 for 191 logged sightings and
-        # B0H77W4411 at $27.99 for 671, neither ever announced, with no
-        # trace explaining why. Anything the gate refuses while the item
-        # looks announceable has to say so out loud.
+        # An item at target that is not going to ping has to say why.
+        # This ran unnoticed for days once already: B0H7FDBNSB sat in
+        # stock at $16.99 for 191 logged sightings and B0H78BB9TY at
+        # $89.99 across 23 windows, neither announced, no trace of the
+        # reason. The only hold left is waiting on a cart button, and it
+        # is bounded by BUY_CONFIRM_GRACE_SECONDS, but it still speaks.
         if observation != "in_stock":
             pn = result.get("price_number")
             looks_live = (
@@ -2647,22 +2717,40 @@ class MonitorWorker(QThread):
                 and target and target > 0 and pn <= target
             )
             if looks_live:
-                sclass = (self.seller_cache.get(asin) or {}).get(
-                    "class", "unresolved")
-                key = (asin, sclass)
+                waited = time.monotonic() - self._at_target_since.get(
+                    asin, time.monotonic())
+                key = (asin, "await_buy_control")
                 if key not in self._gate_logged:
                     self._gate_logged.add(key)
                     self.log.emit(
-                        f"🚧 {asin} IS IN STOCK at {result.get('price')} "
-                        f"(target ${target:.2f}) but the gate is holding it: "
-                        f"seller is {sclass!r}. No ping until that resolves."
+                        f"🚧 {asin} IS AT TARGET at {result.get('price')} "
+                        f"(target ${target:.2f}) on a crawl read with no cart "
+                        f"button to check. Confirming against the product "
+                        f"page; firing anyway in "
+                        f"{max(0.0, BUY_CONFIRM_GRACE_SECONDS - waited):.0f}s "
+                        f"if it will not answer."
                     )
             else:
                 self._gate_logged = {
                     k for k in self._gate_logged if k[0] != asin
                 }
+        else:
+            self._gate_logged = {
+                k for k in self._gate_logged if k[0] != asin
+            }
+            self._unconfirmed_logged.discard(asin)
 
-        prev_eff, new_eff, ended_oos_secs = self._observe(asin, observation)
+        # A cart button seen on the product page at a price at target is
+        # the whole rule, so it confirms itself (see _observe).
+        pn_now = result.get("price_number")
+        authoritative = bool(
+            observation == "in_stock"
+            and result.get("buyable")
+            and target and pn_now is not None and pn_now <= target
+        )
+        prev_eff, new_eff, ended_oos_secs = self._observe(
+            asin, observation, authoritative=authoritative
+        )
 
         # Remember the freshest confirmed-Amazon in-stock read — the
         # stock-list builder uses it for live price/title/image.
