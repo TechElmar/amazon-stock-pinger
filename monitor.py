@@ -280,10 +280,21 @@ STALE_PRODUCT_SECONDS = 20.0
 # gate held them forever: 23 real drops, 146 minutes of buyable time,
 # no pings.
 #
-# A cart button is better evidence anyway. It is the thing that decides
-# whether you can actually buy it, and unlike a wishlist row it cannot
-# be showing some other offer.
-REQUIRE_BUY_CONTROL = True
+# A cart button is better evidence, so a read carrying one fires on the
+# first look (see _observe) instead of waiting out a second read.
+#
+# It is NOT a requirement, and measurement is why. Amazon withholds the
+# buy box from these IPs on exactly the products that matter: fetched
+# during a live B0H78BB9TY drop, the page came back HTTP 200 at 1.24MB,
+# not a shell, with no add-to-cart control anywhere and a $289.95
+# reseller price, while the same item was in stock at $89.99 in a
+# browser. No "Sold by" either, which is the same withheld region.
+#
+# So requiring a button means requiring something Amazon often will not
+# render to us, on the contested drops above all. As a requirement it
+# costs up to BUY_CONFIRM_GRACE_SECONDS on those; as an accelerator it
+# costs nothing and still speeds up every read that does carry one.
+REQUIRE_BUY_CONTROL = False
 
 # But confirmation must never become the new silence. The crawl sees an
 # item at target from a wishlist row, which has no cart button to read,
@@ -1178,6 +1189,13 @@ class HTTPAmazonChecker:
                     "source": proxy_label,
                     "image_url": "",
                     "seller": "",
+                    # Only reached when cheap_verdict said this page is
+                    # NOT in stock (in-stock pages go to the full parse
+                    # above), so there is no buy control to claim. Stated
+                    # explicitly because every result must carry the key:
+                    # a missing one reads as None, and a shape that
+                    # varies by path is how the next bug gets in.
+                    "buyable": False,
                 }
 
             except Exception as e:
