@@ -502,7 +502,24 @@ OOS_CONFIRM_SCANS = 6
 # effective state flips at all. At crawl cadence that is several seconds
 # of solid, agreed-upon OOS. Two minutes on top of that is a real
 # sellout, not parse noise.
-MIN_RESTOCK_OOS_SECONDS = 300
+# ONE MINUTE. Was an hour, then five minutes, and both ate real drops.
+#
+# The rule is: in stock at target, ping. Definitively out of stock,
+# re-arm. Back in stock, ping again. This is not a cooldown on that; it
+# is part of what "definitively out of stock" means.
+#
+# Zero does not work, and it is measurable. OOS_CONFIRM_SCANS agreeing
+# reads take about 4 seconds, and Amazon flickers a listing to
+# "currently unavailable" for a few seconds during inventory updates, so
+# at zero a flicker is indistinguishable from a sellout: replayed, 5
+# second flickers produced 30 pings. A sellout that lasts a full minute
+# is simply better proof than one that lasts four seconds.
+#
+# It costs nothing real. Every one of the 14 restocks missed on
+# 2026-09-26 was 27 minutes or more behind the one before it, and the
+# item was genuinely gone for most of that. Replayed at this value, all
+# 14 still fire.
+MIN_RESTOCK_OOS_SECONDS = 60
 
 # Hard cap on how often ONE item may ping, whatever the reason. Restocks
 # and price drops are allowed to skip the softer anti-nag timers because
@@ -511,9 +528,26 @@ MIN_RESTOCK_OOS_SECONDS = 300
 # 2026-09-17 a buy-box handover between Amazon and a reseller was read as
 # a restock and fired 14 pings in a day, five of them 14 minutes apart at
 # an identical price.
-ABSOLUTE_MIN_REPING_SECONDS = 20 * 60
+# FIVE MINUTES, down from twenty, and the only timer left.
+#
+# It is not here to shape pings. A real cycle cannot hit it: selling out
+# needs 6 agreeing OOS reads and coming back needs a confirmed in-stock
+# read, and the fastest genuine cycle observed is minutes. Every one of
+# the 14 restocks missed on 2026-09-26 had a gap of 27 minutes or more.
+#
+# It is here so that a bug I have not thought of cannot post to 9000
+# people without limit, which has happened once already. It caps an
+# unknown failure at 12 pings an hour instead of unbounded. That is a
+# cheap insurance premium on a channel that size.
+ABSOLUTE_MIN_REPING_SECONDS = 5 * 60
 TARGET_REARM_MARGIN = 0.05                 # price must exceed target by 5%
-MIN_TARGET_REPING_SECONDS = 3 * 60 * 60    # ≥3h between pings per item
+
+# ZERO. A per-item clock cannot tell news from noise, and this one was
+# blocking real events: an item re-armed by a genuine price move was
+# held for three hours purely because the clock said so. What decides
+# whether something may ping again is the evidence (did it definitively
+# sell out, is it at target now), never the hour.
+MIN_TARGET_REPING_SECONDS = 0
 
 # SAME-PRICE SUPPRESSION — the anti-nag rule.
 #
@@ -543,11 +577,16 @@ MIN_TARGET_REPING_SECONDS = 3 * 60 * 60    # ≥3h between pings per item
 # The 14th is 27 minutes after the one before it, which is inside the
 # 20-minute absolute floor's territory and not worth chasing.
 #
-# This cannot bring back the nag it was written for. A same-price re-ping
-# still needs a CONFIRMED sellout of at least MIN_RESTOCK_OOS_SECONDS (6
-# agreeing reads, 5 minutes) to re-arm at all, and an item that simply
-# sits at target never re-arms, so it never reaches this rule.
-SAME_PRICE_REPING_SECONDS = 60 * 60        # ≥1h between identical pings
+# ZERO, in the end. One hour was still an hour of silence over a real
+# sellout and a real return, and the price being the same as last time
+# is not a reason to hide a restock: the whole point is that it is buyable
+# again NOW.
+#
+# The anti-nag job this rule was built for is done by the latch, which is
+# evidence and not a clock. An item that never sells out stays "fired"
+# and never reaches here, however long it sits at target. To speak again
+# it has to definitively sell out first.
+SAME_PRICE_REPING_SECONDS = 0
 PRICE_DROP_EPSILON = 0.01                  # cents of noise = not a drop
 
 DIGEST_INTERVAL_SECONDS = 24 * 60 * 60     # one digest per day
@@ -2880,7 +2919,28 @@ class MonitorWorker(QThread):
         if price_number > target:
             return False, ""
 
-        # At/below target: latch + cooldown decide.
+        prev_announced_early = self.last_pinged_price.get(asin)
+        # A PRICE BELOW WHAT WE ANNOUNCED OUTRANKS THE LATCH.
+        #
+        # The latch exists to stop the same announcement repeating. A
+        # lower price is not the same announcement: it is a better deal
+        # than the one already sent, and the comment below has always
+        # claimed it "skips everything". It did not. The latch was tested
+        # first, so an item that pinged at $89.99 and then fell to $74.99
+        # without ever selling out said nothing at all.
+        #
+        # This cannot loop. Each ping records the new price, so a given
+        # price fires once and an oscillation between two prices fires
+        # only on the first move down. The absolute floor still applies.
+        if (
+            prev_announced_early is not None
+            and price_number < prev_announced_early - PRICE_DROP_EPSILON
+            and time.time() - self.last_target_ping_at.get(asin, 0.0)
+            >= ABSOLUTE_MIN_REPING_SECONDS
+        ):
+            return True, "Price Drop — Target Price Reached"
+
+        # At/below target: the latch decides.
         if self.alert_state.get(asin, "armed") != "armed":
             return False, ""
 
