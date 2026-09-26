@@ -527,9 +527,27 @@ MIN_TARGET_REPING_SECONDS = 3 * 60 * 60    # ≥3h between pings per item
 # The only genuinely new things worth an @role are: the price DROPPED
 # below what we last announced, or the item was truly gone long enough
 # that its return is real news. So a re-ping at the SAME (or higher)
-# price than the last announced one needs a much longer quiet period;
-# any real price drop bypasses it instantly.
-SAME_PRICE_REPING_SECONDS = 24 * 60 * 60   # ≥24h between identical pings
+# price than the last announced one needs a quiet period; any real price
+# drop bypasses it instantly.
+#
+# ONE HOUR, measured, not guessed. At 24h this rule was the single
+# biggest cause of missed pings in the bot: on 2026-09-26 it announced
+# all three 30th Celebration items within minutes of a competing bot,
+# then held its tongue for the rest of the day while that bot posted 14
+# more restocks of the same three at the same prices. Every one was
+# suppressed here, and the log said so 6 times.
+#
+# Replaying that day's 14 alerts against this window:
+#     24h -> 0 of 14      2h -> 9 of 14
+#      3h -> 6 of 14      1h -> 13 of 14
+# The 14th is 27 minutes after the one before it, which is inside the
+# 20-minute absolute floor's territory and not worth chasing.
+#
+# This cannot bring back the nag it was written for. A same-price re-ping
+# still needs a CONFIRMED sellout of at least MIN_RESTOCK_OOS_SECONDS (6
+# agreeing reads, 5 minutes) to re-arm at all, and an item that simply
+# sits at target never re-arms, so it never reaches this rule.
+SAME_PRICE_REPING_SECONDS = 60 * 60        # ≥1h between identical pings
 PRICE_DROP_EPSILON = 0.01                  # cents of noise = not a drop
 
 DIGEST_INTERVAL_SECONDS = 24 * 60 * 60     # one digest per day
