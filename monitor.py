@@ -398,7 +398,7 @@ ROTATING_TIMEOUT_SECONDS = 12
 #
 # Healthy steady state was ~3/s, so 4/s leaves headroom without letting
 # a bad patch accelerate into a worse one.
-DP_MAX_PER_SECOND = 4.0
+DP_MAX_PER_SECOND = 6.0
 
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
@@ -3919,10 +3919,25 @@ class MonitorWorker(QThread):
                 # So: report the median product, the worst product, and how
                 # many are genuinely behind. The worst number is the one
                 # that decides whether a drop is caught.
+                # TIER-AWARE, because otherwise this line lies the other
+                # way. Once 30 of 48 products became cold on purpose at a
+                # 90s interval, "median 90.0s" and "30/48 over 20s
+                # behind" were both true and both meaningless: the cold
+                # items are SUPPOSED to be 90s stale. Reporting them as
+                # starvation buried the one number that matters, which is
+                # whether a HOT item has gone quiet.
+                #
+                # So freshness is measured over the hot tier only, and the
+                # cold tier is reported separately as a count. With no
+                # hot.txt every product is hot and this is the old
+                # behaviour exactly.
                 now_mono = time.monotonic()
+                enabled_all = list(self._enabled_products())
+                measured = ([a for a in enabled_all if a in self.hot_asins]
+                            if self.hot_asins else enabled_all)
                 ages = sorted(
                     (now_mono - self._last_good_scan[a], a)
-                    for a in self._enabled_products()
+                    for a in measured
                     if a in self._last_good_scan
                 )
                 crawl_pct = (crawl / scans * 100) if scans else 0.0
@@ -3938,9 +3953,10 @@ class MonitorWorker(QThread):
                 good_rate = max(scans - errs, 0) / SCAN_RATE_LOG_SECONDS
                 gaps = sorted(
                     self._good_gap[a]
-                    for a in self._enabled_products()
+                    for a in measured
                     if a in self._good_gap
                 )
+                cold_n = len(enabled_all) - len(measured)
                 if ages:
                     # Typical refresh INTERVAL, not age-since-last-read.
                     med = gaps[len(gaps) // 2] if gaps else 0.0
@@ -3948,15 +3964,18 @@ class MonitorWorker(QThread):
                     behind = sum(
                         1 for age, _ in ages if age >= STALE_PRODUCT_SECONDS
                     )
+                    label = "hot " if self.hot_asins else ""
                     freshness = (
                         f"checked every {med:.1f}s ({good_rate:.1f}/s) | "
-                        f"worst {worst_age:.0f}s ({worst_asin})"
+                        f"{label}worst {worst_age:.0f}s ({worst_asin})"
                     )
                     if behind:
                         freshness += (
-                            f" | ⚠ {behind}/{len(ages)} over "
+                            f" | ⚠ {behind}/{len(ages)} {label}over "
                             f"{STALE_PRODUCT_SECONDS:.0f}s behind"
                         )
+                    if cold_n:
+                        freshness += f" | +{cold_n} cold"
                 else:
                     freshness = f"checked every 0.0s ({good_rate:.1f}/s)"
 
