@@ -204,9 +204,9 @@ WISHLIST_CYCLE_MIN_SLEEP = 0.05
 
 # BURST-CONFIRM: the instant a targeted, armed item first reads in stock
 # at/below its target, the crawler drops into a short high-rate window so
-# the SECOND (confirming) read lands in a fraction of a second instead of
-# waiting out drop-time block storms. The 2-read false-ping guard stays
-# fully intact — this only makes confirm #2 fast, never skips it.
+# the confirming read lands in a fraction of a second instead of waiting
+# out drop-time block storms. Only active while IN_STOCK_CONFIRM_SCANS > 1;
+# at 1 the first read already fires and there is nothing to confirm.
 WISHLIST_BURST_SECONDS = 3.0    # how long one candidate keeps the crawl hot
 WISHLIST_BURST_SLEEP = 0.1      # inter-cycle gap while bursting
 
@@ -265,6 +265,29 @@ DP_BACKOFF_SECONDS = 2.0
 # backed-off item does not trip it, but low enough that a genuinely
 # neglected product shows up long before a drop is missed.
 STALE_PRODUCT_SECONDS = 20.0
+
+# HOT / COLD TIERS.
+#
+# The /dp/ budget is fixed (DP_MAX_PER_SECOND) and it was being split 45
+# ways, so every product got a page read about once every 11 seconds no
+# matter how likely it was to drop. That is backwards. Measured over a
+# week: 16 of the 45 have been in stock CONTINUOUSLY, thousands of reads
+# each, sitting above target, and cannot fire a ping at all. They were
+# consuming a third of the budget to tell us nothing changed.
+#
+# So the watchlist is split. Hot items get hammered; cold items tick over
+# just fast enough to catch a price drop. The total request rate does not
+# go up (the rate limiter still caps it), it just stops being wasted:
+# with 13 hot items the same budget checks each of them roughly every 4
+# seconds instead of every 11.
+#
+# hot.txt holds the hot list, one ASIN per line. It is deliberately a
+# file and not a rule about product names, so the tier is explicit and
+# can be changed without touching code or restarting anything but the
+# service.
+HOT_LIST_FILE = "hot.txt"
+HOT_SCAN_INTERVAL = 0.5        # hot: ask as fast as the limiter allows
+COLD_SCAN_INTERVAL = 90.0      # cold: a standing listing, just watch price
 
 # WHAT A PING IS ALLOWED TO FIRE ON.
 #
@@ -452,6 +475,10 @@ def extract_show_more_url(html: str) -> str:
 #
 #   IN_STOCK_CONFIRM_SCANS — small, so genuine restocks are caught
 #     fast (an item with a price reads in-stock on nearly every probe).
+#     1 since 2026-09-27: the first in-stock read fires. The second read
+#     used to come from the instant /dp/ confirm (~0.7s), and a drop can
+#     sell out inside that. A missed drop costs more than an occasional
+#     ping on a row the product page would not have backed up.
 #
 #   OOS_CONFIRM_SCANS — large, because a FALSE out-of-stock is the
 #     expensive mistake: it starts the restock clock and eventually
@@ -461,7 +488,7 @@ def extract_show_more_url(html: str) -> str:
 #     ones) never accumulates enough in a row to flip the state.
 #
 # An "unknown" observation neither advances nor resets the counters.
-IN_STOCK_CONFIRM_SCANS = 2
+IN_STOCK_CONFIRM_SCANS = 1
 OOS_CONFIRM_SCANS = 6
 
 # ===================== NOTIFICATION MODEL =====================
@@ -740,6 +767,66 @@ def extract_price_number(price_text):
         return None
 
 
+# The buy box's offer listing id, straight out of the Buy Now / Add to
+# Cart form. Amazon needs it (with the ASIN) to accept a Buy Now request,
+# so the extension can skip reading the product page entirely when the
+# ping already carries it. Regex, not BeautifulSoup: this runs on the
+# hot path and the value only ever sits in a hidden input or a JSON blob.
+#
+# Extension only. It never goes near a Discord message.
+OFFER_ID_PATTERNS = [
+    re.compile(
+        r"""name=["'](?:items\[0\.base\]\[offerListingId\]|offerListingID)["']"""
+        r"""[^>]*value=["']([^"']+)""",
+        re.I,
+    ),
+    re.compile(
+        r"""value=["']([^"']+)["'][^>]*"""
+        r"""name=["'](?:items\[0\.base\]\[offerListingId\]|offerListingID)["']""",
+        re.I,
+    ),
+    re.compile(r"""["']offerListingI[dD]["']\s*:\s*["']([^"']+)["']""", re.I),
+]
+
+
+def _buy_box_form(html: str) -> str:
+    """The <form> around the buy box (id="addToCart", else the one holding
+    the Buy Now button). Sponsored carousels carry OTHER ASINs' offer ids
+    in their own forms and ad URLs, so the id is only ever read from in
+    here. "" when the page has no buy box at all."""
+    at = -1
+    for marker in ('id="addToCart"', "id='addToCart'",
+                   'id="buy-now-button"', "id='buy-now-button'"):
+        at = html.find(marker)
+        if at >= 0:
+            break
+    if at < 0:
+        return ""
+    start = html.rfind("<form", 0, at)
+    end = html.find("</form>", at)
+    if start < 0 or end < 0:
+        return ""
+    return html[start:end]
+
+
+def extract_offer_id(html: str) -> str:
+    """The buy box offer listing id, or "" when the page has none.
+
+    An out-of-stock page still renders an offerListingID input, empty, so
+    every pattern demands a non-empty value.
+    """
+    if not html:
+        return ""
+    form = _buy_box_form(html)
+    if not form:
+        return ""
+    for pattern in OFFER_ID_PATTERNS:
+        match = pattern.search(form)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
 class RateLimiter:
     """Token bucket capping calls per second across all callers.
 
@@ -803,6 +890,29 @@ def is_shell_page(html: str) -> bool:
 
 
 _RE_ANY_PRICE = re.compile(r"\$[0-9,]+\.[0-9]{2}")
+
+
+def load_hot_asins() -> set:
+    """Load the HOT tier: the ASINs worth spending the /dp/ budget on.
+
+    One ASIN per line in hot.txt, blank lines and # comments ignored.
+    Anything after the ASIN on a line (a name, a note) is ignored too, so
+    the file can be readable.
+
+    Missing file means every product is hot, which is the old behaviour.
+    """
+    path = PROXIES_FILE.parent / HOT_LIST_FILE
+    out: set = set()
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        token = line.split()[0].upper()
+        if len(token) == 10 and token.isalnum():
+            out.add(token)
+    return out
 
 
 def load_rotating_proxies() -> List[str]:
@@ -1122,6 +1232,9 @@ class HTTPAmazonChecker:
             "source": proxy_label,
             "image_url": image_url,
             "seller": seller,
+            # For the extension's instant Buy Now. Product page only:
+            # the wishlist crawl has nothing like it to read.
+            "offer_id": extract_offer_id(html),
             # A REAL buy control was on the page, at a real price. This
             # is the strongest evidence the bot can get that the item is
             # actually purchasable right now, and it is what a ping is
@@ -1246,6 +1359,7 @@ class HTTPAmazonChecker:
                     "source": proxy_label,
                     "image_url": "",
                     "seller": "",
+                    "offer_id": "",
                     # Only reached when cheap_verdict said this page is
                     # NOT in stock (in-stock pages go to the full parse
                     # above), so there is no buy control to claim. Stated
@@ -1281,6 +1395,7 @@ class HTTPAmazonChecker:
             "source": proxy_label,
             "image_url": "",
             "seller": "",
+            "offer_id": "",
             "buyable": False,
         }
 
@@ -1588,6 +1703,8 @@ class WishlistScanner:
                 "source": "wishlist",
                 "image_url": image_url,
                 "seller": seller,
+                # No buy box on a wishlist row, so no offer id either.
+                "offer_id": "",
                 # A wishlist row has no Add-to-Cart control to inspect —
                 # it says "In stock" on the strength of a price alone,
                 # and the price it shows is not always the buy box. So
@@ -1680,6 +1797,9 @@ class MonitorWorker(QThread):
         # it so the cooldown can leave them alone.
         self.rotating_proxies: List[str] = []
         self._rotating_labels: set = set()
+        # HOT tier (hot.txt). Empty set means "no tiering, everything is
+        # hot", which is the behaviour from before hot.txt existed.
+        self.hot_asins: set = set()
         # Concurrency cap on the gateway, created lazily because a
         # Semaphore must be bound to the running event loop.
         self._rotating_sem: Optional[asyncio.Semaphore] = None
@@ -1704,6 +1824,9 @@ class MonitorWorker(QThread):
             else None
         )
         self.discord_session = None
+        # WebSocket feed for the Chrome extension (ws_feed.py). None when
+        # disabled or when the port could not be bound.
+        self.alert_feed = None
         self.checker: Optional["HTTPAmazonChecker"] = None
 
         # Target-alert latch per ASIN: "armed" | "fired". Missing key
@@ -2094,9 +2217,33 @@ class MonitorWorker(QThread):
         """Send the @everyone target alert to primary + optional
         secondary webhooks. The target price itself is never included
         in the message."""
+        asin = product["asin"]
+
+        # Extension feed first: it is a local socket write, so it lands
+        # ahead of the Discord round trips. Plain listing URL, no
+        # affiliate tag; tags belong to the Discord pings only.
+        if self.alert_feed is not None:
+            feed_kwargs = {
+                "asin": asin,
+                "title": result.get("title", ""),
+                "price": result.get("price", ""),
+                "reason": reason,
+                "url": result.get("url", ""),
+                "image_url": result.get("image_url", ""),
+                # Lets the extension send Buy Now without reading the
+                # product page first. Extension feed only: the Discord
+                # kwargs below deliberately do not carry it.
+                "offer_id": result.get("offer_id", "") or "",
+            }
+
+            async def _feed_send():
+                n = await self.alert_feed.send_ping(**feed_kwargs)
+                return True, f"🔌 Extension feed ping sent to {n} client(s)."
+
+            self._spawn_send(_feed_send, "extension feed")
+
         if self.discord_session is None:
             return
-        asin = product["asin"]
         # Seller for the embed — from this scan if it carried one,
         # else the cache (pings only fire seller-confirmed, so one of
         # these is always the Amazon entity name).
@@ -3372,6 +3519,18 @@ class MonitorWorker(QThread):
 
             if time.monotonic() < burst_until:
                 await asyncio.sleep(0.1)
+            elif self.hot_asins and asin not in self.hot_asins:
+                # COLD, and this is checked BEFORE cursed and crawl-blind
+                # on purpose. Both of those branches poll FASTER than
+                # normal to dig an item out of a bad state, and a cold
+                # item is not worth digging out.
+                #
+                # Measured the hard way: with this test placed after
+                # them, three cold items that were cursed took 1052 of
+                # ~1140 /dp/ reads in four minutes, 92% of the budget,
+                # and starved the 13 hot items down to one read every
+                # 32s. Tier decides first; only then does state.
+                await asyncio.sleep(COLD_SCAN_INTERVAL)
             elif asin in self.cursed_asins:
                 await asyncio.sleep(CURSED_SCAN_INTERVAL)
             elif self._is_crawl_blind(asin):
@@ -3380,6 +3539,8 @@ class MonitorWorker(QThread):
                 # fetch was landing on an item the crawl already cannot
                 # describe and Amazon is increasingly refusing to serve.
                 await asyncio.sleep(DP_BACKOFF_SECONDS)
+            elif self.hot_asins:
+                await asyncio.sleep(HOT_SCAN_INTERVAL)
             else:
                 await asyncio.sleep(self._read_interval())
 
@@ -4173,6 +4334,29 @@ class MonitorWorker(QThread):
             self.scan_proxies = list(proxies)
             self.log.emit(f"HTTP checker loaded {len(proxies)} source(s).")
 
+            # HOT tier. Loaded before the pools so the split is the first
+            # thing in the log: it decides where every request goes.
+            self.hot_asins = load_hot_asins()
+            if self.hot_asins:
+                enabled = set((self._enabled_products() or {}).keys())
+                hot_live = self.hot_asins & enabled if enabled else self.hot_asins
+                cold = (enabled - self.hot_asins) if enabled else set()
+                self.log.emit(
+                    f"🔥 Tiers: {len(hot_live)} HOT (every ~{HOT_SCAN_INTERVAL:.1f}s), "
+                    f"{len(cold)} cold (every {COLD_SCAN_INTERVAL:.0f}s). "
+                    f"The /dp/ budget goes to the hot list."
+                )
+                missing = self.hot_asins - enabled if enabled else set()
+                if missing:
+                    self.log.emit(
+                        f"⚠️ hot.txt lists {len(missing)} ASIN(s) not in the "
+                        f"watchlist: {', '.join(sorted(missing))}"
+                    )
+            else:
+                self.log.emit(
+                    "🔥 No hot.txt — every product is hot (no tiering)."
+                )
+
             # Optional rotating-gateway pool.
             self.rotating_proxies = load_rotating_proxies()
             self._rotating_labels = {
@@ -4217,6 +4401,19 @@ class MonitorWorker(QThread):
             except Exception as e:
                 self.bot = None
                 self.log.emit(f"🤖 Bot init failed, webhooks unaffected: {e}")
+
+            # Chrome extension feed, also purely additive.
+            try:
+                from ws_feed import AlertFeed, WS_ENABLED
+                if WS_ENABLED:
+                    feed = AlertFeed(log=self.log.emit)
+                    if await feed.start():
+                        self.alert_feed = feed
+                else:
+                    self.log.emit("🔌 Extension feed disabled (AMP_WS_ENABLED=0).")
+            except Exception as e:
+                self.alert_feed = None
+                self.log.emit(f"🔌 Extension feed failed to start, pings unaffected: {e}")
 
             async with aiohttp.ClientSession() as discord_session:
                 self.discord_session = discord_session
@@ -4300,6 +4497,12 @@ class MonitorWorker(QThread):
                                 await self.bot.close()
                             except Exception:
                                 pass
+                        if self.alert_feed is not None:
+                            try:
+                                await self.alert_feed.close()
+                            except Exception:
+                                pass
+                            self.alert_feed = None
                         for t in tasks:
                             if not t.done():
                                 t.cancel()
