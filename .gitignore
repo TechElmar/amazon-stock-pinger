@@ -38,3 +38,15 @@ ENV/
 
 # Logs
 *.log
+
+# Chrome extension and its feed — NEVER goes to GitHub
+extension/
+ws_feed.py
+
+# Rotating gateway credentials (same rule as proxies.txt)
+proxies_rotating.txt
+
+# Local tier list and watchlist backups — personal product data
+hot.txt
+watchlist.backup.txt
+watchlist.txt.bak-*
