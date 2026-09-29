@@ -296,7 +296,26 @@ STALE_PRODUCT_SECONDS = 20.0
 # can be changed without touching code or restarting anything but the
 # service.
 HOT_LIST_FILE = "hot.txt"
-HOT_SCAN_INTERVAL = 0.0        # hot: ask as fast as the limiter allows
+HOT_SCAN_INTERVAL = 0.0
+
+# Overlapping probes per HOT item.
+#
+# Amazon answers in 1.6s, so one request in flight per product caps
+# that product at a ~1.9s refresh however everything else is tuned.
+# Real restock windows are far shorter, so the only way to see them
+# is to keep several staggered requests in flight for the SAME item.
+#
+# Per-item refresh is about 1.9s / HOT_PROBES:
+#     1 probe  -> 1.9s      3 probes -> 0.63s
+#     2 probes -> 0.95s     4 probes -> 0.48s
+#
+# Safe because _maybe_announce is synchronous and nothing awaits
+# between the fired-latch check and the latch being set, so two
+# probes landing together cannot both fire. Verified, not assumed.
+#
+# Costs scale linearly in requests and CPU, so raise it while
+# watching '% blocked' and the process CPU, not on faith.
+HOT_PROBES = int(os.environ.get("AMP_HOT_PROBES", "3"))        # hot: ask as fast as the limiter allows
 COLD_SCAN_INTERVAL = 90.0      # cold: a standing listing, just watch price
 
 # WHAT A PING IS ALLOWED TO FIRE ON.
@@ -383,7 +402,7 @@ ROTATING_FOR_MONITOR = True
 # Steady state actually needs ~6 req/s at ~2s each, so roughly 12-15
 # connections. 60 leaves room for bursts and still sits well under the
 # cap. Requests above it wait a moment instead of being refused.
-ROTATING_MAX_CONCURRENT = 60
+ROTATING_MAX_CONCURRENT = 120
 
 # Timeout for rotating-gateway requests.
 #
@@ -3363,6 +3382,7 @@ class MonitorWorker(QThread):
         product,
         checker,
         proxies,
+        stagger: float = 0.0,
     ):
         """One product, one loop, forever. Each product gets its own
         asyncio task — a slow ASIN's timeout doesn't block any other.
@@ -3377,6 +3397,11 @@ class MonitorWorker(QThread):
         # in case the user wants to act fast.
         last_stock_oos = False
         burst_until = 0.0
+
+        # Spread this probe across the round trip so the probes for
+        # one product do not all hit Amazon at the same instant.
+        if stagger > 0:
+            await asyncio.sleep(stagger)
 
         while self.running:
             try:
@@ -4549,14 +4574,26 @@ class MonitorWorker(QThread):
                     if not products:
                         self.log.emit("No enabled products to check.")
 
-                    tasks = [
-                        asyncio.create_task(
-                            self.scan_product_forever(p, checker, proxies)
-                        )
-                        for p in products
-                    ]
+                    # HOT items get HOT_PROBES overlapping probes, staggered so
+                    # they spread across the round trip instead of firing in
+                    # lockstep. Cold items keep a single probe.
+                    tasks = []
+                    for p in products:
+                        asin_p = p.get("asin")
+                        n_probes = (HOT_PROBES
+                                    if (self.hot_asins and asin_p in self.hot_asins)
+                                    else 1)
+                        for k in range(max(1, n_probes)):
+                            tasks.append(asyncio.create_task(
+                                self.scan_product_forever(
+                                    p, checker, proxies,
+                                    stagger=(1.9 / max(1, n_probes)) * k,
+                                )
+                            ))
                     self.log.emit(
-                        f"Spawned {len(tasks)} product scan tasks. "
+                        f"Spawned {len(tasks)} scan tasks "
+                        f"({HOT_PROBES} probes on each hot item, "
+                        f"~{1.9/max(1,HOT_PROBES):.2f}s refresh each). "
                         f"Each rotates through {len(proxies)} proxies."
                     )
 
