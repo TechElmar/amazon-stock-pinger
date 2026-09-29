@@ -16,6 +16,7 @@ from PySide6.QtCore import QThread, Signal
 
 from notifier import DiscordNotifier
 from database import ANY_PRICE_TARGET
+import fastparse
 
 # lxml parses Amazon's ~0.5MB HTML 5-10x faster than the pure-Python
 # html.parser. At wishlist fan-out rates (~13 parses/sec) that's the
@@ -196,7 +197,13 @@ WISHLIST_PAGE_RETRIES = 4
 # capacity is worth far more spent on per-product fetches, which is
 # what actually decides how fast one item is noticed. It still fills
 # the digest and covers products whose own fetch is failing.
-WISHLIST_CYCLE_SECONDS = 0.5
+# The crawl now serves COLD items only, and they are checked every
+# COLD_SCAN_INTERVAL (90s). Running it twice a second meant parsing
+# 5 pages ~180x more often than anything needed, and it was the
+# second-largest consumer of the single core the hot items depend
+# on. 15s keeps cold coverage comfortably inside 90s and keeps the
+# crawl available as the fallback if /dp/ ever hard-blocks.
+WISHLIST_CYCLE_SECONDS = 15.0
 # Floor between crawl cycles. A cycle is ~1.5s of real fetching, so this
 # floor is almost never the limiter; keep it small so the crawl runs
 # genuinely back-to-back rather than idling between sweeps.
@@ -221,7 +228,10 @@ WISHLIST_BURST_SLEEP = 0.1      # inter-cycle gap while bursting
 # Beyond this the product stops waiting on the crawl and fetches for
 # itself, so no item can sit stale through repeated cycles. Sized a
 # few crawl cycles wide so the private fetch is the exception.
-WISHLIST_FRESH_SECONDS = 8.0
+# Must exceed WISHLIST_CYCLE_SECONDS or every cold item would find the
+# crawl stale and fetch its own page, which is the cost this tier
+# exists to avoid.
+WISHLIST_FRESH_SECONDS = 45.0
 
 # How often to re-walk the pagination chain sequentially.
 #
@@ -286,7 +296,7 @@ STALE_PRODUCT_SECONDS = 20.0
 # can be changed without touching code or restarting anything but the
 # service.
 HOT_LIST_FILE = "hot.txt"
-HOT_SCAN_INTERVAL = 0.5        # hot: ask as fast as the limiter allows
+HOT_SCAN_INTERVAL = 0.0        # hot: ask as fast as the limiter allows
 COLD_SCAN_INTERVAL = 90.0      # cold: a standing listing, just watch price
 
 # WHAT A PING IS ALLOWED TO FIRE ON.
@@ -398,7 +408,7 @@ ROTATING_TIMEOUT_SECONDS = 12
 #
 # Healthy steady state was ~3/s, so 4/s leaves headroom without letting
 # a bad patch accelerate into a worse one.
-DP_MAX_PER_SECOND = 6.0
+DP_MAX_PER_SECOND = 100.0
 
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
@@ -406,6 +416,20 @@ DP_MAX_PER_SECOND = 6.0
 # is a soft block, not an ambiguous page, and must be treated as a
 # failure so the item falls back to crawl data instead of hammering.
 SHELL_PAGE_MAX_BYTES = 600 * 1024
+
+# Stop the transfer once we have everything the parser reads. The
+# deepest field measured is corePrice at 369KB and the title at
+# 355KB; the remaining ~1MB is reviews and recommendations.
+#
+# This buys no latency (a 457KB read took the same 1.6s as 1.6MB,
+# so the wait is Amazon's response time, not the download) but it
+# cuts bytes 2.6x, which is both bandwidth and the decompress and
+# scan cost on a 2-core box where the event loop is the ceiling.
+#
+# Deliberately ABOVE SHELL_PAGE_MAX_BYTES so is_shell_page's size
+# guard still short-circuits real pages: a truncated page can never
+# be mistaken for a shell. Shells are ~320KB and arrive whole.
+FETCH_MAX_BYTES = 460 * 1024
 
 # SELLER CACHE WARMING.
 #
@@ -1304,12 +1328,30 @@ class HTTPAmazonChecker:
                     timeout=(ROTATING_TIMEOUT_SECONDS if minimal_headers
                              else HTTP_TIMEOUT_SECONDS),
                     allow_redirects=True,
+                    stream=True,
                 )
 
                 if r.status_code >= 400:
+                    try:
+                        await r.aclose()
+                    except Exception:
+                        pass
                     return self.empty_result(asin, f"HTTP {r.status_code}", proxy_label)
 
-                html = r.text
+                # Read only as far as the parser needs, then hang up.
+                # See FETCH_MAX_BYTES.
+                buf = bytearray()
+                try:
+                    async for chunk in r.aiter_content():
+                        buf.extend(chunk)
+                        if len(buf) >= FETCH_MAX_BYTES:
+                            break
+                finally:
+                    try:
+                        await r.aclose()
+                    except Exception:
+                        pass
+                html = buf.decode("utf-8", "replace")
 
                 head_lower = html[:CAPTCHA_SCAN_BYTES].lower()
                 if "captcha" in head_lower or "robot check" in head_lower:
@@ -1330,6 +1372,19 @@ class HTTPAmazonChecker:
                 # Only a page that COULD ping gets the full parse, which
                 # is also the only time we need seller, image and the
                 # exact price.
+                # REGEX FIRST. The DOM build was 445ms of CPU per page against
+                # 6ms for the same six fields by regex, measured on this box,
+                # and it agrees with the DOM on stock, price, buyable and
+                # seller across every real page tested. That one call was the
+                # entire throughput ceiling: one event loop, one core, ~4
+                # in-stock reads a second.
+                #
+                # fast_parse returns None when the page is shaped unlike
+                # anything measured, and only then does the DOM run.
+                fast = fastparse.fast_parse(asin, html, proxy_label, url)
+                if fast is not None:
+                    return fast
+
                 head = html[:PARSE_HTML_MAX_BYTES]
                 stock, price, title = cheap_verdict(head)
                 if stock in ("In stock", "Pre-order"):
@@ -3342,7 +3397,24 @@ class MonitorWorker(QThread):
                 # case, and no product can go stale unnoticed.
                 seen = self._wishlist_seen.get(asin)
                 fresh = (
-                    seen is not None
+                    # A HOT item NEVER substitutes the crawl for its own page.
+                    # This gate is what made the crawl the only source that ever
+                    # ran: while it held any opinion that was not "Unknown", the
+                    # fetch below was skipped entirely, so a hot item polled its
+                    # cache instead of Amazon and no interval tuning could change
+                    # that.
+                    #
+                    # It cost two drops on 2026-09-28. A wishlist row renders ONE
+                    # offer and it is not always the buy box: B0H783FY5Z read
+                    # "In stock $199.97" from a reseller row every 30s for half
+                    # an hour, above its $55 target so correctly silent, while the
+                    # real buy box dropped twice underneath it. The product page
+                    # was never asked.
+                    #
+                    # Cold items still take the cheap path: the crawl covers 10
+                    # products per request and they are not worth a fetch each.
+                    asin not in self.hot_asins
+                    and seen is not None
                     and (time.monotonic() - seen[1]) <= WISHLIST_FRESH_SECONDS
                     # Fresh is not enough: the reading has to SAY something.
                     # Some items (unreleased ones especially) render on the
@@ -3399,7 +3471,13 @@ class MonitorWorker(QThread):
 
                     # Own fetch failed and the crawl has something, even
                     # if stale: stale beats blind.
-                    if self._is_error_result(result) and asin in self.wishlist_results:
+                    # A HOT item never falls back to crawl data. It would be
+                    # announcing a reseller row instead of the buy box, which
+                    # is the bug this whole change exists to kill. A failed
+                    # fetch just means retry, in HOT_SCAN_INTERVAL.
+                    if (self._is_error_result(result)
+                            and asin not in self.hot_asins
+                            and asin in self.wishlist_results):
                         result = dict(self.wishlist_results[asin])
                         proxy_source = f"{result.get('source', 'wishlist')}/stale"
                         raw_results = []
@@ -3573,6 +3651,14 @@ class MonitorWorker(QThread):
             for ai, dat in results.items():
                 prod = enabled_by_asin.get(ai)
                 if prod is None:
+                    continue
+                # HOT items are decided by their own product page and
+                # nothing else. A wishlist row renders ONE offer, which
+                # is not always the buy box: a reseller row at $199.97
+                # masked two real drops on B0H783FY5Z. The crawl still
+                # covers cold items, and still fills wishlist_results so
+                # the stock list and digest stay complete.
+                if ai in self.hot_asins:
                     continue
                 self._maybe_announce(
                     prod, dict(dat), source=f"wishlist/{source}"
