@@ -153,6 +153,20 @@ CURSED_SCAN_INTERVAL = 0.5
 PROFILE_ROTATION_ENABLED = False
 STATIC_IMPERSONATE_PROFILE = "chrome146"
 
+# Browser fingerprints the rotating/ISP path cycles through.
+#
+# chrome146 is NOT in here on purpose. On 2026-10-01 Amazon was
+# challenging chrome146, chrome131 and firefox133 on IPs where every
+# one of these got real pages first try. The block followed the
+# fingerprint, not the address, which is why five fresh IPs on two
+# unrelated networks were all captcha'd within the same minute.
+# Each was validated to parse identically to the DOM parser.
+FP_PROFILES = ["chrome124", "edge101", "safari17_0",
+               "safari18_0", "safari_ios"]
+FP_WINDOW = 20             # recent reads judged per profile
+FP_BAD_RATIO = 0.5         # challenged on half of them -> bench it
+FP_BENCH_SECONDS = 15 * 60
+
 ROTATION_FAIL_THRESHOLD = 0.35
 ROTATION_COOLDOWN_SECONDS = 60
 ROTATION_MIN_SAMPLES = 30
@@ -315,7 +329,11 @@ HOT_SCAN_INTERVAL = 0.0
 #
 # Costs scale linearly in requests and CPU, so raise it while
 # watching '% blocked' and the process CPU, not on faith.
-HOT_PROBES = int(os.environ.get("AMP_HOT_PROBES", "3"))        # hot: ask as fast as the limiter allows
+# Per-probe backoff after a failed read (block, captcha, timeout).
+# Doubles per consecutive failure, resets on the first good read.
+HOT_ERROR_BACKOFF_BASE = 0.5
+HOT_ERROR_BACKOFF_MAX = 4.0
+HOT_PROBES = int(os.environ.get("AMP_HOT_PROBES", "1"))        # hot: ask as fast as the limiter allows
 COLD_SCAN_INTERVAL = 90.0      # cold: a standing listing, just watch price
 
 # WHAT A PING IS ALLOWED TO FIRE ON.
@@ -427,7 +445,23 @@ ROTATING_TIMEOUT_SECONDS = 12
 #
 # Healthy steady state was ~3/s, so 4/s leaves headroom without letting
 # a bad patch accelerate into a worse one.
-DP_MAX_PER_SECOND = 100.0
+# THE SPIRAL BRAKE. Do not raise this because it looks idle.
+#
+# It was set to 100 on 2026-09-29 as "not binding", and the same day
+# /dp/ ran away to 52 req/s at 89% blocked. A blocked request returns
+# in ~85ms, so failures loop far faster than successes, and only a
+# token bucket caps that: a semaphore limits requests IN FLIGHT, and
+# a failed one is in flight for almost no time. Normal demand is
+# ~17/s with 3 probes on 18 hot items; 25 leaves headroom and still
+# stops a storm.
+# 2026-09-29: 3 probes ran ~17 req/s and the gateway range was
+# flagged 24 minutes later, then stayed 25-97% blocked all day.
+# Every night at 3.6-6.4 req/s it held 0%. This gateway's
+# sustainable rate against /dp/ is in that band, so the cap sits
+# just above it. Faster needs more IP capacity, not a bigger number.
+# 5 ISP IPs at the time of writing: 4/s is ~0.8 req/s per IP and ~0.16
+# per IP+fingerprint pair. Raise this as IPs are added, not before.
+DP_MAX_PER_SECOND = 4.0
 
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
@@ -449,6 +483,51 @@ SHELL_PAGE_MAX_BYTES = 600 * 1024
 # guard still short-circuits real pages: a truncated page can never
 # be mistaken for a shell. Shells are ~320KB and arrive whole.
 FETCH_MAX_BYTES = 460 * 1024
+# Raw pages the parser could not classify. See _capture_unknown.
+CAPTURE_DIR = Path("captures")
+CAPTURE_MIN_GAP_SECONDS = 20.0   # per ASIN
+CAPTURE_KEEP = 300               # newest files kept on disk
+_capture_last: Dict[str, float] = {}
+
+
+def _unknown_reason(html: str) -> str:
+    """Why a page is neither in stock nor out of stock, in one line."""
+    btn_ids = sorted(set(re.findall(
+        r'(?:id|name)="([^"]*(?:cart|buy|preorder|pre-order|checkout|atc)[^"]*)"',
+        html, re.I)))[:8]
+    prices = re.findall(r'\$[\d,]+\.\d{2}', html[:FETCH_MAX_BYTES])[:4]
+    i = html.find('id="availability"')
+    avail = ""
+    if i >= 0:
+        avail = " ".join(re.sub(r"<[^>]+>", " ", html[i:i + 700]).split())[:90]
+    return (f"buttons={btn_ids} prices={prices} "
+            f"outOfStock={'id=\"outOfStock\"' in html} avail={avail!r}")
+
+
+def _capture_unknown(asin: str, html: str) -> Optional[str]:
+    """Save the raw page, at most once per ASIN per CAPTURE_MIN_GAP_SECONDS.
+
+    Returns the path written, or None when rate-limited or on error.
+    Never raises: a diagnostics failure must not cost a read."""
+    try:
+        now = time.time()
+        if now - _capture_last.get(asin, 0.0) < CAPTURE_MIN_GAP_SECONDS:
+            return None
+        _capture_last[asin] = now
+        CAPTURE_DIR.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = CAPTURE_DIR / f"{asin}-{stamp}-unknown.html"
+        path.write_text(html, encoding="utf-8", errors="replace")
+        files = sorted(CAPTURE_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-CAPTURE_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(path)
+    except Exception:
+        return None
+
 
 # SELLER CACHE WARMING.
 #
@@ -1402,6 +1481,10 @@ class HTTPAmazonChecker:
                 # anything measured, and only then does the DOM run.
                 fast = fastparse.fast_parse(asin, html, proxy_label, url)
                 if fast is not None:
+                    if fast.get("stock") == "Unknown":
+                        # Neither in stock nor out: keep the page so the next
+                        # one of these can be read instead of guessed at.
+                        _capture_unknown(asin, html)
                     return fast
 
                 head = html[:PARSE_HTML_MAX_BYTES]
@@ -1874,6 +1957,11 @@ class MonitorWorker(QThread):
         # HOT tier (hot.txt). Empty set means "no tiering, everything is
         # hot", which is the behaviour from before hot.txt existed.
         self.hot_asins: set = set()
+        # Fingerprint health and round-robin positions. See FP_PROFILES.
+        self._fp_bench: Dict[str, float] = {}
+        self._fp_hist: Dict[str, List[int]] = {}
+        self._fp_rr = 0
+        self._rot_rr = 0
         # Concurrency cap on the gateway, created lazily because a
         # Semaphore must be bound to the running event loop.
         self._rotating_sem: Optional[asyncio.Semaphore] = None
@@ -2532,6 +2620,41 @@ class MonitorWorker(QThread):
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
+    def _pick_profile(self) -> str:
+        """Next healthy fingerprint, round-robin. If every profile is
+        benched, use them all rather than stop reading."""
+        now = time.monotonic()
+        healthy = [p for p in FP_PROFILES if self._fp_bench.get(p, 0.0) <= now]
+        pool = healthy or FP_PROFILES
+        self._fp_rr += 1
+        return pool[self._fp_rr % len(pool)]
+
+    def _next_rotating(self) -> Optional[str]:
+        """Round-robin across every proxy line, not just the first."""
+        pool = [p for p in (self.rotating_proxies or []) if p]
+        if not pool:
+            return None
+        self._rot_rr += 1
+        return pool[self._rot_rr % len(pool)]
+
+    def _note_profile(self, prof: Optional[str], result: Dict[str, Any]) -> None:
+        """Bench a fingerprint Amazon has started challenging."""
+        if not prof or not isinstance(result, dict):
+            return
+        st = result.get("stock") or ""
+        challenged = "Captcha" in st or "Shell" in st
+        if not challenged and self._is_error_result(result):
+            return          # timeouts say nothing about the fingerprint
+        hist = self._fp_hist.setdefault(prof, [])
+        hist.append(1 if challenged else 0)
+        del hist[:-FP_WINDOW]
+        if len(hist) >= FP_WINDOW // 2 and sum(hist) / len(hist) >= FP_BAD_RATIO:
+            self._fp_bench[prof] = time.monotonic() + FP_BENCH_SECONDS
+            rate = 100 * sum(hist) // len(hist)
+            hist.clear()
+            self.log.emit(f"🧬 fingerprint {prof} challenged on {rate}% of recent "
+                          f"reads, benched {FP_BENCH_SECONDS // 60} min")
+
     def _is_rotating(self, proxy: Optional[str]) -> bool:
         """True when this proxy is a rotating gateway rather than a
         fixed IP."""
@@ -2564,11 +2687,13 @@ class MonitorWorker(QThread):
             async with self._rotating_sem:
                 self._rot_inflight += 1
                 self._rot_peak = max(self._rot_peak, self._rot_inflight)
+                prof = self._pick_profile()
                 session = AsyncSession(
-                    impersonate=STATIC_IMPERSONATE_PROFILE,
+                    impersonate=prof,
                     max_clients=1,
                 )
                 await session.__aenter__()
+                session.fp_profile = prof
                 try:
                     yield session
                 finally:
@@ -2601,13 +2726,15 @@ class MonitorWorker(QThread):
                 self.is_proxy_available, idx,
             )
 
-        proxy = rotating[0]
         raw: List[Dict[str, Any]] = []
         for _attempt in range(2):
+            # Next proxy each attempt, so a retry lands somewhere new.
+            proxy = self._next_rotating() or rotating[0]
             async with self._session_for(proxy) as session:
                 r = await checker.fetch_product(
                     session, asin, proxy, minimal_headers=True
                 )
+                self._note_profile(getattr(session, "fp_profile", None), r)
             raw.append(r)
             if not self._is_error_result(r):
                 return r, raw, idx
@@ -2637,7 +2764,7 @@ class MonitorWorker(QThread):
         nothing" — the crawl's next cycle is still coming, so this can
         only ever ADD a chance to fire early.
         """
-        proxy = self.rotating_proxies[0]
+        proxy = self._next_rotating() or self.rotating_proxies[0]
         try:
             async with self._session_for(proxy) as session:
                 return await self.checker.fetch_product(
@@ -3403,7 +3530,13 @@ class MonitorWorker(QThread):
         if stagger > 0:
             await asyncio.sleep(stagger)
 
+        # Consecutive failed reads on THIS probe. Drives the backoff.
+        err_streak = 0
+
         while self.running:
+            # Reset each pass so a read that raises before assigning
+            # cannot be judged by the previous pass's result.
+            result = None
             try:
                 # FRESHNESS-GATED SOURCE SELECTION.
                 #
@@ -3620,8 +3753,22 @@ class MonitorWorker(QThread):
             except Exception as e:
                 self.log.emit(f"ERROR {asin}: {e}")
 
-            if time.monotonic() < burst_until:
+            try:
+                failed = result is None or self._is_error_result(result)
+            except Exception:
+                failed = True
+            err_streak = err_streak + 1 if failed else 0
+
+            if time.monotonic() < burst_until and not failed:
                 await asyncio.sleep(0.1)
+            elif failed and self.hot_asins and asin in self.hot_asins:
+                # A blocked read returns in ~85ms. Without this a hot
+                # probe re-fires instantly and three of them per item
+                # become a storm that gets the pool blocked harder.
+                await asyncio.sleep(min(
+                    HOT_ERROR_BACKOFF_MAX,
+                    HOT_ERROR_BACKOFF_BASE * (2 ** min(err_streak - 1, 6)),
+                ))
             elif self.hot_asins and asin not in self.hot_asins:
                 # COLD, and this is checked BEFORE cursed and crawl-blind
                 # on purpose. Both of those branches poll FASTER than
