@@ -57,6 +57,10 @@ _OOS_BACK = "we don't know when or if this item will be back"
 _BTN_LITERALS = ('id="add-to-cart-button"', 'name="submit.add-to-cart"',
                  'name="submit.addToCart"', 'id="buy-now-button"',
                  'name="submit.buy-now"', 'name="submit.buyNow"')
+# Amazon's "See All Buying Options" box. It renders inside #buybox in
+# place of the cart and buy-now buttons when no offer holds the buy box.
+_NO_BUY_BOX = 'id="unqualifiedBuyBox_feature_div"'
+
 _PRE_LITERALS = ('id="preorder-button"', 'id="placePreOrderButton"',
                  'name="submit.preorder"', 'name="submit.preorder-update"',
                  'name="submit.pre-order"')
@@ -330,6 +334,13 @@ def fast_parse(asin: str, html: str, proxy_label: str,
         stock, price = "Out of stock", ""
     elif has_buyable_button and price:
         stock = "Pre-order" if has_pre and not has_btn else "In stock"
+    elif not has_buyable_button and _NO_BUY_BOX in html:
+        # NO BUY BUTTON IS PROOF OF OUT OF STOCK. This page was
+        # "Unknown", which the state machine ignores, so three hours of
+        # it never re-armed B0H783FY5Z and its 2:51 AM drop on
+        # 2026-10-02 went unannounced. Nothing here can be bought from
+        # the page, which is the owner's own definition of gone.
+        stock, price = "Out of stock (no buy button)", ""
     else:
         stock = "Unknown"
 

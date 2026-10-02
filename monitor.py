@@ -161,11 +161,19 @@ STATIC_IMPERSONATE_PROFILE = "chrome146"
 # fingerprint, not the address, which is why five fresh IPs on two
 # unrelated networks were all captcha'd within the same minute.
 # Each was validated to parse identically to the DOM parser.
-FP_PROFILES = ["chrome124", "edge101", "safari17_0",
+# Amazon flags a fingerprint after ~20-30 minutes of heavy use, on every
+# IP at once, and releases it 30 minutes to 2+ hours later. More
+# profiles means each carries less load and there are always some off
+# the bench. Left out because they were challenged on first use:
+# edge99, firefox133, firefox135, chrome131, chrome99_android.
+FP_PROFILES = ["chrome146", "chrome124", "chrome120", "chrome116",
+               "edge101", "safari15_5", "safari17_0", "safari17_2_ios",
                "safari18_0", "safari_ios"]
 FP_WINDOW = 20             # recent reads judged per profile
 FP_BAD_RATIO = 0.5         # challenged on half of them -> bench it
-FP_BENCH_SECONDS = 15 * 60
+FP_BENCH_BASE = 60 * 60          # first bench
+FP_BENCH_MAX = 4 * 60 * 60       # cap after repeated offences
+FP_FORGIVE_SECONDS = 4 * 60 * 60 # clean this long and strikes reset
 
 ROTATION_FAIL_THRESHOLD = 0.35
 ROTATION_COOLDOWN_SECONDS = 60
@@ -677,7 +685,10 @@ MIN_RESTOCK_OOS_SECONDS = 60
 # 2026-09-17 a buy-box handover between Amazon and a reseller was read as
 # a restock and fired 14 pings in a day, five of them 14 minutes apart at
 # an identical price.
-# FIVE MINUTES, down from twenty, and the only timer left.
+# TWO MINUTES, down from twenty, then five, and the only timer left.
+# Five held a real restock: B0H783FY5Z pinged 7:27:04 on 2026-10-02,
+# sold out, came back 7:30:28 after a confirmed run, and the floor
+# kept it until 7:32:30 while a competitor pinged at ~7:31.
 #
 # It is not here to shape pings. A real cycle cannot hit it: selling out
 # needs 6 agreeing OOS reads and coming back needs a confirmed in-stock
@@ -686,9 +697,9 @@ MIN_RESTOCK_OOS_SECONDS = 60
 #
 # It is here so that a bug I have not thought of cannot post to 9000
 # people without limit, which has happened once already. It caps an
-# unknown failure at 12 pings an hour instead of unbounded. That is a
+# unknown failure at 30 pings an hour instead of unbounded. That is a
 # cheap insurance premium on a channel that size.
-ABSOLUTE_MIN_REPING_SECONDS = 5 * 60
+ABSOLUTE_MIN_REPING_SECONDS = 2 * 60
 TARGET_REARM_MARGIN = 0.05                 # price must exceed target by 5%
 
 # ZERO. A per-item clock cannot tell news from noise, and this one was
@@ -1961,6 +1972,8 @@ class MonitorWorker(QThread):
         self._fp_bench: Dict[str, float] = {}
         self._fp_hist: Dict[str, List[int]] = {}
         self._fp_rr = 0
+        self._fp_strikes: Dict[str, int] = {}
+        self._fp_last_bench: Dict[str, float] = {}
         self._rot_rr = 0
         # Concurrency cap on the gateway, created lazily because a
         # Semaphore must be bound to the running event loop.
@@ -2649,11 +2662,23 @@ class MonitorWorker(QThread):
         hist.append(1 if challenged else 0)
         del hist[:-FP_WINDOW]
         if len(hist) >= FP_WINDOW // 2 and sum(hist) / len(hist) >= FP_BAD_RATIO:
-            self._fp_bench[prof] = time.monotonic() + FP_BENCH_SECONDS
+            now = time.monotonic()
+            # Repeat offenders sit out longer: Amazon's release time
+            # varies from ~30 min to 2+ hours, and a short bench just
+            # returns a still-flagged profile to fail again.
+            if now - self._fp_last_bench.get(prof, -1e12) > FP_FORGIVE_SECONDS:
+                self._fp_strikes[prof] = 0
+            strikes = self._fp_strikes.get(prof, 0) + 1
+            self._fp_strikes[prof] = strikes
+            self._fp_last_bench[prof] = now
+            secs = min(FP_BENCH_MAX, FP_BENCH_BASE * 2 ** (strikes - 1))
+            self._fp_bench[prof] = now + secs
             rate = 100 * sum(hist) // len(hist)
             hist.clear()
+            live = sum(1 for p in FP_PROFILES if self._fp_bench.get(p, 0.0) <= now)
             self.log.emit(f"🧬 fingerprint {prof} challenged on {rate}% of recent "
-                          f"reads, benched {FP_BENCH_SECONDS // 60} min")
+                          f"reads, benched {secs // 60} min (strike {strikes}); "
+                          f"{live}/{len(FP_PROFILES)} profiles live")
 
     def _is_rotating(self, proxy: Optional[str]) -> bool:
         """True when this proxy is a rotating gateway rather than a
