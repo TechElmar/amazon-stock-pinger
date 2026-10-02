@@ -469,7 +469,10 @@ ROTATING_TIMEOUT_SECONDS = 12
 # just above it. Faster needs more IP capacity, not a bigger number.
 # 5 ISP IPs at the time of writing: 4/s is ~0.8 req/s per IP and ~0.16
 # per IP+fingerprint pair. Raise this as IPs are added, not before.
-DP_MAX_PER_SECOND = 4.0
+# 2026-10-02: 16 ISP IPs (4 Canada, 12 USA; US pages parse identically,
+# same stock, price, buy button and seller). 8/s is 0.5 per IP, a first
+# step; 0.8 per IP (12.8) is the ceiling once a full hour stays clean.
+DP_MAX_PER_SECOND = 8.0
 
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
@@ -493,6 +496,10 @@ SHELL_PAGE_MAX_BYTES = 600 * 1024
 FETCH_MAX_BYTES = 460 * 1024
 # Raw pages the parser could not classify. See _capture_unknown.
 CAPTURE_DIR = Path("captures")
+
+# Last product image seen per ASIN, so a ping whose own read came back
+# without one still shows the product. See _fire_target_pings.
+IMAGE_CACHE_FILE = Path("images.json")
 CAPTURE_MIN_GAP_SECONDS = 20.0   # per ASIN
 CAPTURE_KEEP = 300               # newest files kept on disk
 _capture_last: Dict[str, float] = {}
@@ -2078,6 +2085,19 @@ class MonitorWorker(QThread):
         # bot restarts.
         self.oos_since: Dict[str, float] = {}
 
+        # ASINs whose sold-out state and clock were restored at startup.
+        # A comeback for one of these is a real restock, so it may ping
+        # during the startup sweep. See _restore_oos_clock.
+        self._restored_oos: set = set()
+
+        # Last product image per ASIN, persisted. See IMAGE_CACHE_FILE.
+        self._image_cache: Dict[str, str] = {}
+        try:
+            self._image_cache = dict(json.loads(
+                IMAGE_CACHE_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            self._image_cache = {}
+
         # Seller resolution cache: asin -> {"seller", "class", "ts"}.
         # class is "amazon" | "third_party" | "unknown". Refreshed for
         # free whenever a scan result carries seller info; otherwise a
@@ -2288,6 +2308,16 @@ class MonitorWorker(QThread):
 
     def evaluate_asin_cursed(self, asin: str):
         """Flag ASINs with high HTTP fail rate as cursed → parallel scan path."""
+        # HOT items are never cursed. Racing 3 proxies costs 3 tokens from
+        # the shared /dp/ limiter per read; on 2026-10-02 seven cursed hot
+        # items held useful reads to 4/s under an 8/s cap, and the flag
+        # (fail rate since start) would not clear for an hour. Hot probes
+        # have their own error backoff.
+        if asin in self.hot_asins:
+            if asin in self.cursed_asins:
+                self.cursed_asins.discard(asin)
+                self.log.emit(f"ASIN {asin} un-cursed: hot items read one proxy at a time.")
+            return
         stats = self.asin_stats.get(asin)
         if not stats:
             return
@@ -2394,6 +2424,10 @@ class MonitorWorker(QThread):
         in the message."""
         asin = product["asin"]
 
+        image_url = result.get("image_url") or self._image_cache.get(asin, "")
+        if image_url and not result.get("image_url"):
+            self.log.emit(f"🖼️ {asin}: ping read had no image, using the saved one.")
+
         # Extension feed first: it is a local socket write, so it lands
         # ahead of the Discord round trips. Plain listing URL, no
         # affiliate tag; tags belong to the Discord pings only.
@@ -2404,7 +2438,7 @@ class MonitorWorker(QThread):
                 "price": result.get("price", ""),
                 "reason": reason,
                 "url": result.get("url", ""),
-                "image_url": result.get("image_url", ""),
+                "image_url": image_url,
                 # Lets the extension send Buy Now without reading the
                 # product page first. Extension feed only: the Discord
                 # kwargs below deliberately do not carry it.
@@ -2431,7 +2465,7 @@ class MonitorWorker(QThread):
             "price": result.get("price", ""),
             "reason": reason,
             "url": with_affiliate_tag(result.get("url", "")),
-            "image_url": result.get("image_url", ""),
+            "image_url": image_url,
             "seller": seller,
         }
         for n in (self.notifier, self.secondary_notifier, self.bot):
@@ -3438,6 +3472,28 @@ class MonitorWorker(QThread):
             reason = "Target Price Reached"
         return True, reason
 
+    def _restore_oos_clock(self, prod: dict) -> bool:
+        """Carry a sold-out state and its clock across a restart.
+
+        Only for a row the last run had confirmed as out of stock. The
+        cause of that run is not persisted, so it is taken as a real
+        sellout: at worst one extra ping if a reseller held the buy box
+        across the restart, against a missed drop if it did not.
+        """
+        asin = prod.get("asin")
+        oos_at = prod.get("oos_since")
+        if not asin or oos_at is None or prod.get("effective_state") != "oos":
+            return False
+        try:
+            started = float(oos_at)
+        except (TypeError, ValueError):
+            return False
+        self.oos_since[asin] = started
+        self.effective_state[asin] = "oos"
+        self._oos_was_real[asin] = True
+        self._restored_oos.add(asin)
+        return True
+
     def _maybe_announce(
         self,
         product: dict,
@@ -3452,6 +3508,17 @@ class MonitorWorker(QThread):
             target = float(product.get("target_price") or 0)
         except (TypeError, ValueError):
             target = 0.0
+
+        img = result.get("image_url") or ""
+        if img:
+            new_img = asin not in self._image_cache
+            self._image_cache[asin] = img
+            if new_img:
+                try:
+                    IMAGE_CACHE_FILE.write_text(
+                        json.dumps(self._image_cache), encoding="utf-8")
+                except Exception as e:
+                    self.log.emit(f"image cache save error: {e}")
 
         should, reason = self._should_alert(asin, result, target)
         if not should:
@@ -3483,7 +3550,15 @@ class MonitorWorker(QThread):
         # out. The item stays armed; if it's still at target when the
         # list is built, the list latches it "fired" (it's visible on
         # today's list — that IS its announcement).
-        if not self._startup_sweep_done:
+        # A KNOWN SELLOUT COMING BACK IS NOT A RESTART ARTIFACT. The sweep
+        # exists so a restart cannot announce what was already in stock.
+        # An item the last run had confirmed sold out, now back, is a real
+        # restock; holding it for 3 minutes and then latching it silently
+        # would miss the drop outright.
+        comeback_after_restart = (
+            asin in self._restored_oos and reason.startswith("Restocked")
+        )
+        if not self._startup_sweep_done and not comeback_after_restart:
             if asin not in self._sweep_held_logged:
                 self._sweep_held_logged.add(asin)
                 self.log.emit(
@@ -4323,7 +4398,7 @@ class MonitorWorker(QThread):
                     float(price_number) if price_number is not None else None
                 ),
                 "url": with_affiliate_tag(url),
-                "image_url": live.get("image_url") or "",
+                "image_url": live.get("image_url") or self._image_cache.get(asin, ""),
                 "target": float(prod.get("target_price") or 0),
             })
         items.sort(key=lambda it: (it["title"] or "").lower())
@@ -4574,15 +4649,15 @@ class MonitorWorker(QThread):
         #   1. Persisted armed/fired latches (products.alert_state).
         #   2. The last ping timestamp (products.last_pinged_at) so the
         #      re-ping cooldown spans restarts.
-        #   3. A clean slate for the stock-state machine: we do NOT
-        #      reload effective_state, and we wipe persisted oos_since
-        #      — a restock re-arm requires a real ≥1h OOS run observed
-        #      entirely AFTER startup.
+        #   3. Sold-out items keep their state and clock (2026-10-02, see
+        #      _restore_oos_clock). Everything else starts clean: no
+        #      effective_state, and any stray oos_since is wiped.
         # ==============================================================
         try:
             products = self.db.get_products()
             restored = 0
             cleared_clocks = 0
+            kept_clocks = 0
             for prod in products:
                 asin = prod["asin"]
 
@@ -4610,7 +4685,9 @@ class MonitorWorker(QThread):
                     except (ValueError, TypeError):
                         pass
 
-                if prod.get("oos_since") is not None:
+                if self._restore_oos_clock(prod):
+                    kept_clocks += 1
+                elif prod.get("oos_since") is not None:
                     try:
                         self.db.save_oos_since(asin, None)
                     except Exception as e:
@@ -4619,7 +4696,8 @@ class MonitorWorker(QThread):
 
             self.log.emit(
                 f"State rehydrated: {restored} alert latches restored, "
-                f"{cleared_clocks} OOS clocks reset. Startup sweep begins "
+                f"{cleared_clocks} OOS clocks reset, {kept_clocks} sold-out "
+                f"clocks kept. Startup sweep begins "
                 f"— no pings until the boot stock list is sent."
             )
         except Exception as e:
