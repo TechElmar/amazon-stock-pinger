@@ -17,6 +17,7 @@ from PySide6.QtCore import QThread, Signal
 from notifier import DiscordNotifier
 from database import ANY_PRICE_TARGET
 import fastparse
+import aodparse
 
 # lxml parses Amazon's ~0.5MB HTML 5-10x faster than the pure-Python
 # html.parser. At wishlist fan-out rates (~13 parses/sec) that's the
@@ -473,6 +474,14 @@ ROTATING_TIMEOUT_SECONDS = 12
 # same stock, price, buy button and seller). 8/s is 0.5 per IP, a first
 # step; 0.8 per IP (12.8) is the ceiling once a full hour stays clean.
 DP_MAX_PER_SECOND = 8.0
+
+# THE OFFER LIST (aodparse.py). While this file exists in the working
+# directory, hot items read Amazon's offer list instead of the product
+# page. It is checked on every read: create it to switch, delete it to
+# switch back, no restart either way. Without it the list runs in
+# shadow at AOD_SHADOW_PER_SECOND: read and logged, never announced.
+AOD_PRIMARY_FLAG = Path("aod_primary.on")
+AOD_SHADOW_PER_SECOND = 3.0
 
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
@@ -2090,6 +2099,11 @@ class MonitorWorker(QThread):
         # during the startup sweep. See _restore_oos_clock.
         self._restored_oos: set = set()
 
+        # Offer-list shadow: last at-target verdict per ASIN, and read
+        # counts for the once-a-minute report. See aod_shadow_loop.
+        self._aod_shadow: Dict[str, bool] = {}
+        self._aod_stats: Dict[str, int] = {"ok": 0, "failed": 0}
+
         # Last product image per ASIN, persisted. See IMAGE_CACHE_FILE.
         self._image_cache: Dict[str, str] = {}
         try:
@@ -3472,6 +3486,123 @@ class MonitorWorker(QThread):
             reason = "Target Price Reached"
         return True, reason
 
+    def _aod_primary(self) -> bool:
+        """True while AOD_PRIMARY_FLAG exists. See its comment."""
+        try:
+            return AOD_PRIMARY_FLAG.exists()
+        except OSError:
+            return False
+
+    async def _read_aod(self, asin: str, target: float, limiter) -> Dict[str, Any]:
+        """One offer-list read through the rotating pool, as a result dict
+        the rest of the bot understands. A failed read comes back as an
+        error result ("Blocked/...", "Network error"), never as sold out."""
+        proxy = self._next_rotating() or (self.rotating_proxies or [None])[0]
+        label = proxy_label_from_url(proxy)
+        checker = self.checker
+        if limiter is not None:
+            await limiter.acquire()
+        prof = None
+        try:
+            async with self._session_for(proxy) as session:
+                prof = getattr(session, "fp_profile", None)
+                r = await session.get(
+                    aodparse.URL.format(asin=asin),
+                    headers={
+                        "Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8",
+                        "Referer": f"https://www.amazon.ca/dp/{asin}",
+                    },
+                    proxy=proxy,
+                    timeout=ROTATING_TIMEOUT_SECONDS,
+                )
+                status = r.status_code
+                html = r.text
+        except Exception:
+            return checker.empty_result(asin, "Network error", label)
+        if status >= 400:
+            return checker.empty_result(asin, f"HTTP {status}", label)
+        head = html[:8000].lower()
+        if "captcha" in head or "robot check" in head:
+            res = checker.empty_result(asin, "Blocked/Captcha", label)
+            self._note_profile(prof, res)
+            return res
+        res = aodparse.verdict(asin, html, target, label)
+        if res is None:
+            # A 200 that is not an offer list is a failed read, not a sellout.
+            return checker.empty_result(asin, "Blocked/Unrecognized", label)
+        res["via"] = "offers"
+        res.setdefault("offer_id", "")
+        self._note_profile(prof, res)
+        return res
+
+    async def _aod_shadow_one(self, asin: str, target: float) -> None:
+        """Shadow read: log when the offer list starts or stops showing an
+        offer at target, next to what the product page says. No ping."""
+        try:
+            r = await self._read_aod(asin, target, None)
+        except Exception:
+            self._aod_stats["failed"] += 1
+            return
+        if self._is_error_result(r):
+            self._aod_stats["failed"] += 1
+            return
+        self._aod_stats["ok"] += 1
+        at = r.get("stock") == "In stock"
+        prev = self._aod_shadow.get(asin)
+        self._aod_shadow[asin] = at
+        if prev is None or prev == at:
+            return
+        page = self.effective_state.get(asin) or "unknown"
+        if at:
+            self.log.emit(
+                f"🛒 OFFER LIST {asin}: at target, {r.get('price')} from "
+                f"{r.get('seller')} (product page says {page}). Shadow, no ping."
+            )
+        else:
+            self.log.emit(
+                f"🛒 OFFER LIST {asin}: nothing at target now (lowest "
+                f"{r.get('aod_lowest') or 'none'}; product page says {page})."
+            )
+
+    async def aod_shadow_loop(self) -> None:
+        """Read every hot item's offer list alongside the product page and
+        LOG what it shows. Never announces. The side-by-side proof promised
+        before switching (AOD_PRIMARY_FLAG). Idles while primary is on."""
+        limiter = RateLimiter(AOD_SHADOW_PER_SECOND)
+        report_at = time.monotonic() + 60
+        while self.running:
+            if self._aod_primary() or not self.hot_asins or self.checker is None:
+                await asyncio.sleep(5)
+                continue
+            enabled = self._enabled_products() or {}
+            spawned = 0
+            for asin in sorted(self.hot_asins):
+                if not self.running or self._aod_primary():
+                    break
+                prod = enabled.get(asin)
+                if not prod:
+                    continue
+                try:
+                    target = float(prod.get("target_price") or 0)
+                except (TypeError, ValueError):
+                    target = 0.0
+                await limiter.acquire()
+                task = asyncio.create_task(self._aod_shadow_one(asin, target))
+                self.background_tasks.add(task)
+                task.add_done_callback(self.background_tasks.discard)
+                spawned += 1
+                if time.monotonic() >= report_at:
+                    st = self._aod_stats
+                    n = st["ok"] + st["failed"]
+                    self.log.emit(
+                        f"🛒 Offer list (shadow): {n} reads in the last minute, "
+                        f"{100 * st['failed'] // max(1, n)}% failed."
+                    )
+                    self._aod_stats = {"ok": 0, "failed": 0}
+                    report_at = time.monotonic() + 60
+            if not spawned:
+                await asyncio.sleep(5)
+
     def _restore_oos_clock(self, prod: dict) -> bool:
         """Carry a sold-out state and its clock across a restart.
 
@@ -3707,6 +3838,22 @@ class MonitorWorker(QThread):
                                 n_parallel=CURSED_PARALLEL_PROXIES,
                             )
                         )
+                    elif asin in self.hot_asins and self._aod_primary():
+                        # THE OFFER LIST (aodparse.py, AOD_PRIMARY_FLAG). Sees
+                        # Amazon's offer even when a reseller or nobody holds the
+                        # buy box. One retry on the next proxy, like _scan_once.
+                        try:
+                            tgt = float(((self._enabled_products() or {}).get(asin)
+                                         or product).get("target_price") or 0)
+                        except (TypeError, ValueError, AttributeError):
+                            tgt = 0.0
+                        raw_results = []
+                        for _attempt in range(2):
+                            result = await self._read_aod(asin, tgt, checker.rate_limiter)
+                            raw_results.append(result)
+                            if not self._is_error_result(result):
+                                break
+                        new_idx = idx
                     else:
                         result, raw_results, new_idx = await self._scan_once(
                             checker, asin, proxies, idx
@@ -3847,7 +3994,8 @@ class MonitorWorker(QThread):
                 # adding signal, so only our OWN fetches announce here.
                 if not used_wishlist:
                     self._maybe_announce(
-                        product, result, source=f"dp/{proxy_source}"
+                        product, result,
+                        source=f"{result.get('via', 'dp')}/{proxy_source}"
                     )
 
             except Exception as e:
@@ -4873,6 +5021,7 @@ class MonitorWorker(QThread):
                     tasks.append(asyncio.create_task(self.seller_warmer_forever()))
                     tasks.append(asyncio.create_task(self.cookie_reset_loop()))
                     tasks.append(asyncio.create_task(self.daily_digest_loop()))
+                    tasks.append(asyncio.create_task(self.aod_shadow_loop()))
                     if PROFILE_ROTATION_ENABLED:
                         tasks.append(asyncio.create_task(self.profile_rotation_loop()))
 
