@@ -473,7 +473,10 @@ ROTATING_TIMEOUT_SECONDS = 12
 # 2026-10-02: 16 ISP IPs (4 Canada, 12 USA; US pages parse identically,
 # same stock, price, buy button and seller). 8/s is 0.5 per IP, a first
 # step; 0.8 per IP (12.8) is the ceiling once a full hour stays clean.
-DP_MAX_PER_SECOND = 8.0
+# 2026-10-03: 3/s. The offer list (aodparse.py) now does most of the
+# checking at 15KB a read; a product page read is ~115KB, and the proxy
+# plan has ~1.1TB a month. 3/s of product pages is ~30GB/day unblocked.
+DP_MAX_PER_SECOND = 3.0
 
 # THE OFFER LIST (aodparse.py). While this file exists in the working
 # directory, hot items read Amazon's offer list instead of the product
@@ -481,7 +484,11 @@ DP_MAX_PER_SECOND = 8.0
 # switch back, no restart either way. Without it the list runs in
 # shadow at AOD_SHADOW_PER_SECOND: read and logged, never announced.
 AOD_PRIMARY_FLAG = Path("aod_primary.on")
-AOD_SHADOW_PER_SECOND = 3.0
+AOD_SHADOW_PER_SECOND = 5.0
+# While this file exists, the offer-list reader ANNOUNCES (through the
+# same latch as the product page) instead of only logging. Checked per
+# read: delete it to go back to logging only, no restart.
+AOD_LIVE_FLAG = Path("aod_live.on")
 
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
@@ -3486,6 +3493,13 @@ class MonitorWorker(QThread):
             reason = "Target Price Reached"
         return True, reason
 
+    def _aod_live(self) -> bool:
+        """True while AOD_LIVE_FLAG exists. See its comment."""
+        try:
+            return AOD_LIVE_FLAG.exists()
+        except OSError:
+            return False
+
     def _aod_primary(self) -> bool:
         """True while AOD_PRIMARY_FLAG exists. See its comment."""
         try:
@@ -3535,7 +3549,8 @@ class MonitorWorker(QThread):
         self._note_profile(prof, res)
         return res
 
-    async def _aod_shadow_one(self, asin: str, target: float) -> None:
+    async def _aod_shadow_one(self, asin: str, target: float,
+                             prod: Optional[dict] = None) -> None:
         """Shadow read: log when the offer list starts or stops showing an
         offer at target, next to what the product page says. No ping."""
         try:
@@ -3547,6 +3562,10 @@ class MonitorWorker(QThread):
             self._aod_stats["failed"] += 1
             return
         self._aod_stats["ok"] += 1
+        live = prod is not None and self._aod_live()
+        if live:
+            # Same gate as a product page read: latch, floor, startup sweep.
+            self._maybe_announce(prod, r, source=f"offers/{r.get('source', '')}")
         at = r.get("stock") == "In stock"
         prev = self._aod_shadow.get(asin)
         self._aod_shadow[asin] = at
@@ -3556,7 +3575,8 @@ class MonitorWorker(QThread):
         if at:
             self.log.emit(
                 f"🛒 OFFER LIST {asin}: at target, {r.get('price')} from "
-                f"{r.get('seller')} (product page says {page}). Shadow, no ping."
+                f"{r.get('seller')} (product page says {page})."
+                + ("" if live else " Shadow, no ping.")
             )
         else:
             self.log.emit(
@@ -3587,7 +3607,7 @@ class MonitorWorker(QThread):
                 except (TypeError, ValueError):
                     target = 0.0
                 await limiter.acquire()
-                task = asyncio.create_task(self._aod_shadow_one(asin, target))
+                task = asyncio.create_task(self._aod_shadow_one(asin, target, prod))
                 self.background_tasks.add(task)
                 task.add_done_callback(self.background_tasks.discard)
                 spawned += 1
@@ -3595,7 +3615,8 @@ class MonitorWorker(QThread):
                     st = self._aod_stats
                     n = st["ok"] + st["failed"]
                     self.log.emit(
-                        f"🛒 Offer list (shadow): {n} reads in the last minute, "
+                        f"🛒 Offer list ({'LIVE' if self._aod_live() else 'shadow'}): "
+                        f"{n} reads in the last minute, "
                         f"{100 * st['failed'] // max(1, n)}% failed."
                     )
                     self._aod_stats = {"ok": 0, "failed": 0}
