@@ -405,6 +405,13 @@ BUY_CONFIRM_GRACE_SECONDS = 25.0
 # means nothing changes and the bot behaves exactly as it does today.
 ROTATING_PROXY_FILE = "proxies_rotating.txt"
 
+# Per-job pools (2026-10-05). A product page read costs ~290KB on the wire,
+# an offer-list read ~25KB, and only some proxy plans are metered. Each job
+# can have its own list in the same format; a missing or empty file means
+# that job uses ROTATING_PROXY_FILE as before.
+PAGE_PROXY_FILE = "proxies_pages.txt"     # product pages and ping confirms
+OFFER_PROXY_FILE = "proxies_offers.txt"   # the offer list (aodparse.py)
+
 # Staged rollout. Confirms first: lowest volume, highest value, and the
 # cleanest place to read a block rate. Flip the monitor flag only once
 # the confirm numbers look good.
@@ -476,7 +483,9 @@ ROTATING_TIMEOUT_SECONDS = 12
 # 2026-10-03: 3/s. The offer list (aodparse.py) now does most of the
 # checking at 15KB a read; a product page read is ~115KB, and the proxy
 # plan has ~1.1TB a month. 3/s of product pages is ~30GB/day unblocked.
-DP_MAX_PER_SECOND = 3.0
+# 5/s since half the pool is the proxyon gateway, which has no data cap:
+# IPRoyal carries half of 5 x 115KB + 5 x 15KB, ~28GB/day unblocked.
+DP_MAX_PER_SECOND = 5.0
 
 # THE OFFER LIST (aodparse.py). While this file exists in the working
 # directory, hot items read Amazon's offer list instead of the product
@@ -1071,14 +1080,14 @@ def load_hot_asins() -> set:
     return out
 
 
-def load_rotating_proxies() -> List[str]:
+def load_rotating_proxies(name: str = ROTATING_PROXY_FILE) -> List[str]:
     """Load the optional rotating-gateway pool.
 
     Same line formats as load_proxies(). Returns [] when the file is
     missing or empty, which is the signal to behave exactly as before.
     Socks5 is accepted as-is, since rotating providers often offer both.
     """
-    path = PROXIES_FILE.parent / ROTATING_PROXY_FILE
+    path = PROXIES_FILE.parent / name
     out: List[str] = []
     if not path.exists():
         return out
@@ -2110,6 +2119,11 @@ class MonitorWorker(QThread):
         # counts for the once-a-minute report. See aod_shadow_loop.
         self._aod_shadow: Dict[str, bool] = {}
         self._aod_stats: Dict[str, int] = {"ok": 0, "failed": 0}
+        # Per-job pools and their round-robin positions. See PAGE_PROXY_FILE.
+        self._page_pool: List[str] = []
+        self._offer_pool: List[str] = []
+        self._page_rr = 0
+        self._offer_rr = 0
 
         # Last product image per ASIN, persisted. See IMAGE_CACHE_FILE.
         self._image_cache: Dict[str, str] = {}
@@ -2705,6 +2719,22 @@ class MonitorWorker(QThread):
         self._rot_rr += 1
         return pool[self._rot_rr % len(pool)]
 
+    def _next_page_proxy(self) -> Optional[str]:
+        """Next proxy for a product page read. See PAGE_PROXY_FILE."""
+        pool = [p for p in (self._page_pool or []) if p]
+        if not pool:
+            return self._next_rotating()
+        self._page_rr += 1
+        return pool[self._page_rr % len(pool)]
+
+    def _next_offer_proxy(self) -> Optional[str]:
+        """Next proxy for an offer-list read. See OFFER_PROXY_FILE."""
+        pool = [p for p in (self._offer_pool or []) if p]
+        if not pool:
+            return self._next_rotating()
+        self._offer_rr += 1
+        return pool[self._offer_rr % len(pool)]
+
     def _note_profile(self, prof: Optional[str], result: Dict[str, Any]) -> None:
         """Bench a fingerprint Amazon has started challenging."""
         if not prof or not isinstance(result, dict):
@@ -2809,7 +2839,7 @@ class MonitorWorker(QThread):
         raw: List[Dict[str, Any]] = []
         for _attempt in range(2):
             # Next proxy each attempt, so a retry lands somewhere new.
-            proxy = self._next_rotating() or rotating[0]
+            proxy = self._next_page_proxy() or rotating[0]
             async with self._session_for(proxy) as session:
                 r = await checker.fetch_product(
                     session, asin, proxy, minimal_headers=True
@@ -2844,7 +2874,7 @@ class MonitorWorker(QThread):
         nothing" — the crawl's next cycle is still coming, so this can
         only ever ADD a chance to fire early.
         """
-        proxy = self._next_rotating() or self.rotating_proxies[0]
+        proxy = self._next_page_proxy() or self.rotating_proxies[0]
         try:
             async with self._session_for(proxy) as session:
                 return await self.checker.fetch_product(
@@ -3511,7 +3541,7 @@ class MonitorWorker(QThread):
         """One offer-list read through the rotating pool, as a result dict
         the rest of the bot understands. A failed read comes back as an
         error result ("Blocked/...", "Network error"), never as sold out."""
-        proxy = self._next_rotating() or (self.rotating_proxies or [None])[0]
+        proxy = self._next_offer_proxy() or (self.rotating_proxies or [None])[0]
         label = proxy_label_from_url(proxy)
         checker = self.checker
         if limiter is not None:
@@ -4908,6 +4938,17 @@ class MonitorWorker(QThread):
 
             # Optional rotating-gateway pool.
             self.rotating_proxies = load_rotating_proxies()
+            self._page_pool = load_rotating_proxies(PAGE_PROXY_FILE)
+            self._offer_pool = load_rotating_proxies(OFFER_PROXY_FILE)
+            # A per-job line must also count as rotating (fresh session per
+            # request, exempt from cooldown), so it joins the main pool too.
+            for _p in self._page_pool + self._offer_pool:
+                if _p not in self.rotating_proxies:
+                    self.rotating_proxies.append(_p)
+            self.log.emit(
+                f"🔀 Product pages: {len(self._page_pool) or 'main'} pool entries; "
+                f"offer list: {len(self._offer_pool) or 'main'} pool entries."
+            )
             self._rotating_labels = {
                 proxy_label_from_url(p) for p in self.rotating_proxies
             }
