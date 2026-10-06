@@ -493,7 +493,15 @@ DP_MAX_PER_SECOND = 5.0
 # switch back, no restart either way. Without it the list runs in
 # shadow at AOD_SHADOW_PER_SECOND: read and logged, never announced.
 AOD_PRIMARY_FLAG = Path("aod_primary.on")
-AOD_SHADOW_PER_SECOND = 5.0
+AOD_SHADOW_PER_SECOND = 5.0          # starting rate after a restart
+# SELF-TUNING (2026-10-05). Every ping now comes from the offer list, so
+# its rate is the ping speed. Each clean minute (< STEPUP % failed) adds
+# 1/s up to MAX; a bad minute (> BACKOFF % failed) halves it, never below
+# MIN, so a flag costs a minute instead of an hour. See _tune_aod_rate.
+AOD_MAX_PER_SECOND = 10.0
+AOD_MIN_PER_SECOND = 3.0
+AOD_STEPUP_FAIL_PCT = 10
+AOD_BACKOFF_FAIL_PCT = 30
 # While this file exists, the offer-list reader ANNOUNCES (through the
 # same latch as the product page) instead of only logging. Checked per
 # read: delete it to go back to logging only, no restart.
@@ -3614,6 +3622,20 @@ class MonitorWorker(QThread):
                 f"{r.get('aod_lowest') or 'none'}; product page says {page})."
             )
 
+    def _tune_aod_rate(self, limiter, n: int, fail_pct: int) -> None:
+        """Steer the offer-list rate on last minute's failure rate. See
+        AOD_MAX_PER_SECOND. A minute with under 30 reads says nothing."""
+        if n < 30:
+            return
+        if fail_pct > AOD_BACKOFF_FAIL_PCT and limiter.rate > AOD_MIN_PER_SECOND:
+            limiter.rate = max(AOD_MIN_PER_SECOND, limiter.rate / 2)
+            self.log.emit(f"🛒 Offer list slowing to {limiter.rate:.1f}/s: "
+                          f"{fail_pct}% failed last minute.")
+        elif fail_pct < AOD_STEPUP_FAIL_PCT and limiter.rate < AOD_MAX_PER_SECOND:
+            limiter.rate = min(AOD_MAX_PER_SECOND, limiter.rate + 1)
+            self.log.emit(f"🛒 Offer list speeding up to {limiter.rate:.1f}/s: "
+                          f"{fail_pct}% failed last minute.")
+
     async def aod_shadow_loop(self) -> None:
         """Read every hot item's offer list alongside the product page and
         LOG what it shows. Never announces. The side-by-side proof promised
@@ -3644,13 +3666,15 @@ class MonitorWorker(QThread):
                 if time.monotonic() >= report_at:
                     st = self._aod_stats
                     n = st["ok"] + st["failed"]
+                    fail_pct = 100 * st["failed"] // max(1, n)
                     self.log.emit(
                         f"🛒 Offer list ({'LIVE' if self._aod_live() else 'shadow'}): "
-                        f"{n} reads in the last minute, "
-                        f"{100 * st['failed'] // max(1, n)}% failed."
+                        f"{n} reads in the last minute at {limiter.rate:.0f}/s, "
+                        f"{fail_pct}% failed."
                     )
                     self._aod_stats = {"ok": 0, "failed": 0}
                     report_at = time.monotonic() + 60
+                    self._tune_aod_rate(limiter, n, fail_pct)
             if not spawned:
                 await asyncio.sleep(5)
 
