@@ -99,9 +99,16 @@ class DiscordNotifier:
     async def _post_raw(self, session: aiohttp.ClientSession, payload: dict):
         """POST and return (status, body_text). status None on network
         error."""
+        url = self.webhook_url
+        # A plain webhook ignores components unless the request says
+        # with_components=true. With it, Discord allows the non-interactive
+        # ones: text, sections, thumbnails, separators and LINK buttons,
+        # which is all these messages use. (2026-10-06)
+        if payload.get("components"):
+            url += ("&" if "?" in url else "?") + "with_components=true"
         try:
             async with session.post(
-                self.webhook_url,
+                url,
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
@@ -143,30 +150,28 @@ class DiscordNotifier:
         if not self.webhook_url:
             return False, "Webhook is empty."
 
-        # Components V2 gives the nicest layout, but PLAIN incoming
-        # webhooks cannot carry components at all: Discord strips them
-        # and then rejects the message as empty (50006). Only an
-        # application-owned webhook or a bot can send them. So try V2
-        # once, remember the answer, and never pay for that round trip
-        # again on a webhook that cannot do it.
-        if self._supports_components is not False:
-            payload = self._alert_v2_payload(
-                title=title, asin=asin, price=price, reason=reason,
-                url=url, image_url=image_url, seller=seller,
-            )
-            status, body = await self._post_raw(session, payload)
-            if status in (200, 204):
-                self._supports_components = True
-                return True, "Discord target alert sent (components v2)."
-            if status != 400:
-                return False, (
-                    f"Discord target alert failed: {status} {str(body)[:150]}"
-                )
-            self._supports_components = False
-
+        # PLAIN TEXT, THEN THE EMBED, THEN LINK BUTTONS (2026-10-06).
+        # Phone notifications show only a message's plain text, so the
+        # mention, product and price ride in `content`. The button-card
+        # layout (Components V2) forbids `content` and left pushes blank,
+        # so alerts are the classic embed plus ordinary link-button rows,
+        # which a plain webhook may send with with_components=true.
+        payload = self._alert_embed_payload(
+            title=title, asin=asin, price=price, reason=reason,
+            url=url, image_url=image_url, seller=seller, mention=mention,
+            buttons=True,
+        )
+        status, body = await self._post_raw(session, payload)
+        if status in (200, 204):
+            return True, "Discord target alert sent."
+        if status != 400:
+            return False, f"Discord target alert failed: {status} {str(body)[:150]}"
+        # A webhook that refuses the buttons still gets the alert, with the
+        # add-to-cart links as markdown in the embed instead.
         fb = self._alert_embed_payload(
             title=title, asin=asin, price=price, reason=reason,
             url=url, image_url=image_url, seller=seller, mention=mention,
+            buttons=False,
         )
         return await self._post(session, fb, "target alert")
 
@@ -175,8 +180,13 @@ class DiscordNotifier:
         """Container → role pill → H1 heading → section w/ thumbnail →
         separators → ATC quantity row → Listing row."""
         blocks = []
-        if PING_ROLE_ID:
-            blocks.append({"type": 10, "content": PING_MENTION})
+        # First line = what a phone notification shows, so it names the
+        # product and price, like the embed alert's content line does.
+        blocks.append({
+            "type": 10,
+            "content": f"{PING_MENTION} 🎯 **{_short(title, 120) or 'Amazon Product'}** "
+                       f"@ {price or '-'}",
+        })
         blocks.append({
             "type": 10,
             "content": "# 🎯 Amazon.ca Restock Alert",
@@ -235,11 +245,11 @@ class DiscordNotifier:
         return payload
 
     def _alert_embed_payload(self, *, title, asin, price, reason, url,
-                             image_url, seller, mention):
-        """Embed alert. This is the LIVE path for plain incoming
-        webhooks, which cannot render components, so it has to carry the
-        full design on its own: heading, spaced detail lines, thumbnail,
-        credit footer, and markdown add-to-cart links."""
+                             image_url, seller, mention, buttons=False):
+        """Embed alert: plain-text line (what a phone notification shows),
+        then the embed: heading, detail lines, thumbnail, credit footer.
+        With buttons=True the add-to-cart and listing links are real link
+        buttons under the embed; otherwise markdown links inside it."""
         try:
             host = (urlparse(url).netloc or "Amazon").replace("www.", "")
         except Exception:
@@ -259,9 +269,10 @@ class DiscordNotifier:
         ]
         if seller:
             body.append(f"**Seller:** {seller}")
-        body += ["", f"🛒 {actions}"]
-        if url:
-            body.append(f"📄 [**View Listing**]({url})")
+        if not buttons:
+            body += ["", f"🛒 {actions}"]
+            if url:
+                body.append(f"📄 [**View Listing**]({url})")
 
         embed = {
             "author": {"name": f"{host} Restock Alert"},
@@ -278,6 +289,18 @@ class DiscordNotifier:
             "content": f"{mention} 🎯 **{_short(title, 120)}** @ {price or '—'}",
             "embeds": [embed],
         }
+        if buttons:
+            rows = [{"type": 1, "components": [
+                {"type": 2, "style": 5, "label": f"ATC {q}",
+                 "emoji": {"name": "🛒"}, "url": _atc_url(asin, q)}
+                for q in ATC_QUANTITIES
+            ]}]
+            if url:
+                rows.append({"type": 1, "components": [{
+                    "type": 2, "style": 5, "label": "Listing",
+                    "emoji": {"name": "📄"}, "url": url,
+                }]})
+            payload["components"] = rows
         if PING_ROLE_ID:
             payload["allowed_mentions"] = {"roles": [PING_ROLE_ID]}
         return payload
