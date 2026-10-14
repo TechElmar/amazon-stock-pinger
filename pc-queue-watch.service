@@ -1,0 +1,14 @@
+[Unit]
+Description=Pokemon Center CA queue watcher (passive logging, no pings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/stock-pinger
+ExecStart=/opt/stock-pinger/venv/bin/python /opt/stock-pinger/pc_watch.py
+Restart=always
+RestartSec=15
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
