@@ -50,3 +50,7 @@ proxies_rotating.txt
 hot.txt
 watchlist.backup.txt
 watchlist.txt.bak-*
+
+# Pokemon Center alert webhooks (secrets)
+pc_alert.json
+pc_samples/
