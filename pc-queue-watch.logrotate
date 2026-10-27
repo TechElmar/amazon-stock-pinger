@@ -1,0 +1,9 @@
+/var/log/pc-queue-watch.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
