@@ -485,7 +485,10 @@ ROTATING_TIMEOUT_SECONDS = 12
 # plan has ~1.1TB a month. 3/s of product pages is ~30GB/day unblocked.
 # 5/s since half the pool is the proxyon gateway, which has no data cap:
 # IPRoyal carries half of 5 x 115KB + 5 x 15KB, ~28GB/day unblocked.
-DP_MAX_PER_SECOND = 5.0
+# 2/s since 2026-10-26: proxyon answers 407 (plan/login), so product pages
+# moved to the metered IPRoyal New York lines (proxies_pages.txt); a page
+# read is ~290KB on the wire, so 2/s is ~50GB/day. Back up when proxyon is.
+DP_MAX_PER_SECOND = 2.0
 
 # THE OFFER LIST (aodparse.py). While this file exists in the working
 # directory, hot items read Amazon's offer list instead of the product
@@ -502,6 +505,11 @@ AOD_MAX_PER_SECOND = 10.0
 AOD_MIN_PER_SECOND = 3.0
 AOD_STEPUP_FAIL_PCT = 10
 AOD_BACKOFF_FAIL_PCT = 30
+# Per-line health for the offer list (2026-10-26). See _note_offer_proxy.
+OFFER_WINDOW = 10
+OFFER_BENCH_FAILS = 6
+OFFER_BENCH_SECONDS = 10 * 60
+OFFER_PER_PROXY_MAX = 0.8        # offer-list reads/s per live line, at most
 # While this file exists, the offer-list reader ANNOUNCES (through the
 # same latch as the product page) instead of only logging. Checked per
 # read: delete it to go back to logging only, no restart.
@@ -2132,6 +2140,9 @@ class MonitorWorker(QThread):
         self._offer_pool: List[str] = []
         self._page_rr = 0
         self._offer_rr = 0
+        # Offer-list line health. See _note_offer_proxy.
+        self._offer_hist: Dict[str, List[int]] = {}
+        self._offer_bench: Dict[str, float] = {}
 
         # Last product image per ASIN, persisted. See IMAGE_CACHE_FILE.
         self._image_cache: Dict[str, str] = {}
@@ -2736,12 +2747,45 @@ class MonitorWorker(QThread):
         return pool[self._page_rr % len(pool)]
 
     def _next_offer_proxy(self) -> Optional[str]:
-        """Next proxy for an offer-list read. See OFFER_PROXY_FILE."""
+        """Next proxy for an offer-list read. See OFFER_PROXY_FILE. Lines
+        on the bench are skipped; if every line is benched, use them all."""
         pool = [p for p in (self._offer_pool or []) if p]
         if not pool:
             return self._next_rotating()
+        now = time.monotonic()
+        live = [p for p in pool if self._offer_bench.get(p, 0.0) <= now] or pool
         self._offer_rr += 1
-        return pool[self._offer_rr % len(pool)]
+        return live[self._offer_rr % len(live)]
+
+    def _offer_live_count(self) -> int:
+        now = time.monotonic()
+        # No offer pool means offer reads use the main pool (see
+        # _next_offer_proxy); no pool at all means nothing to cap by.
+        pool = [p for p in (self._offer_pool or self.rotating_proxies or []) if p]
+        if not pool:
+            return 10 ** 6
+        return sum(1 for p in pool if self._offer_bench.get(p, 0.0) <= now) or len(pool)
+
+    def _note_offer_proxy(self, proxy: Optional[str], res: Dict[str, Any]) -> None:
+        """Score an offer-list read against the line that served it.
+
+        OFFER_BENCH_FAILS failures in its last OFFER_WINDOW reads sits the
+        line out OFFER_BENCH_SECONDS. Measured 2026-10-26: three US lines
+        failed nearly every read (HTTP 503) while the Canadian lines failed
+        none, and the whole list sat at ~45% failed for two days."""
+        if not proxy or proxy not in (self._offer_pool or []):
+            return
+        hist = self._offer_hist.setdefault(proxy, [])
+        hist.append(1 if self._is_error_result(res) else 0)
+        del hist[:-OFFER_WINDOW]
+        if len(hist) >= OFFER_WINDOW and sum(hist) >= OFFER_BENCH_FAILS:
+            self._offer_bench[proxy] = time.monotonic() + OFFER_BENCH_SECONDS
+            hist.clear()
+            self.log.emit(
+                f"🛒 offer-list line {proxy_label_from_url(proxy)} benched "
+                f"{OFFER_BENCH_SECONDS // 60} min; {self._offer_live_count()}/"
+                f"{len(self._offer_pool)} lines live"
+            )
 
     def _note_profile(self, prof: Optional[str], result: Dict[str, Any]) -> None:
         """Bench a fingerprint Amazon has started challenging."""
@@ -3546,10 +3590,17 @@ class MonitorWorker(QThread):
             return False
 
     async def _read_aod(self, asin: str, target: float, limiter) -> Dict[str, Any]:
-        """One offer-list read through the rotating pool, as a result dict
-        the rest of the bot understands. A failed read comes back as an
-        error result ("Blocked/...", "Network error"), never as sold out."""
+        """One offer-list read, scored against the line that served it."""
         proxy = self._next_offer_proxy() or (self.rotating_proxies or [None])[0]
+        res = await self._read_aod_via(asin, target, limiter, proxy)
+        self._note_offer_proxy(proxy, res)
+        return res
+
+    async def _read_aod_via(self, asin: str, target: float, limiter,
+                            proxy: Optional[str]) -> Dict[str, Any]:
+        """One offer-list read through `proxy`, as a result dict the rest of
+        the bot understands. A failed read comes back as an error result
+        ("Blocked/...", "Network error"), never as sold out."""
         label = proxy_label_from_url(proxy)
         checker = self.checker
         if limiter is not None:
@@ -3625,14 +3676,22 @@ class MonitorWorker(QThread):
     def _tune_aod_rate(self, limiter, n: int, fail_pct: int) -> None:
         """Steer the offer-list rate on last minute's failure rate. See
         AOD_MAX_PER_SECOND. A minute with under 30 reads says nothing."""
+        # Never more than OFFER_PER_PROXY_MAX per live line, so benching
+        # lines cannot pile the whole rate onto the few left.
+        cap = max(AOD_MIN_PER_SECOND,
+                  min(AOD_MAX_PER_SECOND, OFFER_PER_PROXY_MAX * self._offer_live_count()))
+        if limiter.rate > cap:
+            limiter.rate = cap
+            self.log.emit(f"🛒 Offer list capped at {cap:.1f}/s for "
+                          f"{self._offer_live_count()} live lines.")
         if n < 30:
             return
         if fail_pct > AOD_BACKOFF_FAIL_PCT and limiter.rate > AOD_MIN_PER_SECOND:
             limiter.rate = max(AOD_MIN_PER_SECOND, limiter.rate / 2)
             self.log.emit(f"🛒 Offer list slowing to {limiter.rate:.1f}/s: "
                           f"{fail_pct}% failed last minute.")
-        elif fail_pct < AOD_STEPUP_FAIL_PCT and limiter.rate < AOD_MAX_PER_SECOND:
-            limiter.rate = min(AOD_MAX_PER_SECOND, limiter.rate + 1)
+        elif fail_pct < AOD_STEPUP_FAIL_PCT and limiter.rate < cap:
+            limiter.rate = min(cap, limiter.rate + 1)
             self.log.emit(f"🛒 Offer list speeding up to {limiter.rate:.1f}/s: "
                           f"{fail_pct}% failed last minute.")
 
