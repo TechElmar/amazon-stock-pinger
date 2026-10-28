@@ -16,6 +16,13 @@ offer means sold out.
 Every offer that can be added to the cart carries the seller and price in
 its button label: aria-label="Add to Cart from seller X and price $Y".
 That label is the whole signal; it only exists where the button does.
+
+PRE-ORDERS (owner, 2026-10-28: count them as in stock). A pre-order offer
+has no aria-label; the same words sit in the button's screen-reader text
+instead: <span class="a-offscreen"> Add to Cart from seller X and price
+$Y </span>, inside a button classed aod-atc-preorder-btn. Missing that
+form hid every pre-order: the 30th Celebration Battle Deck (B0H7FR54KK)
+never pinged while competitors pinged its drops.
 """
 import re
 from datetime import datetime
@@ -25,7 +32,8 @@ URL = ("https://www.amazon.ca/gp/product/ajax/aodAjaxMain/ref=dp_aod_ALL_mbc"
        "?asin={asin}&pc=dp&experienceId=aodAjaxMain")
 
 _RE_ATC = re.compile(
-    r'aria-label="Add to Cart from seller (.+?) and price \$([\d,]+\.\d\d)\s*"')
+    r'(?:aria-label="|class="a-offscreen">\s*)'
+    r'Add to Cart from seller (.+?) and price \$([\d,]+\.\d\d)\s*["<]')
 _RE_COND = re.compile(r'id="aod-offer-heading".{0,400}?a-text-bold">\s*([^<]+?)\s*<', re.S)
 _RE_TEXT = re.compile(r">\s*([^<>]{2,300}?)\s*<")
 _RE_IMG = re.compile(r'id="pinned-image-id".{0,800}?src="(https://m\.media-amazon\.com/images/[^"]+)"', re.S)
@@ -53,6 +61,7 @@ def offers(html: str) -> Optional[List[Dict[str, Any]]]:
             "seller": _unent(atc.group(1)) if atc else "",
             "price_number": float(atc.group(2).replace(",", "")) if atc else None,
             "atc": bool(atc),
+            "preorder": "aod-atc-preorder-btn" in blk,
             # A block with no heading is taken as new: the list defaults to
             # new offers and every block measured had one.
             "condition": _unent(cond.group(1)) if cond else "",
@@ -95,9 +104,11 @@ def verdict(asin: str, html: str, target: float, source: str) -> Optional[Dict[s
         "aod_lowest": ("$%.2f %s" % (lowest["price_number"], lowest["seller"])) if lowest else "",
     }
     if best:
+        # A pre-order counts exactly like Add to Cart (owner, 2026-10-28),
+        # so it reads "In stock" for everything downstream; preorder says which.
         res.update(stock="In stock", price="$%.2f" % best["price_number"],
                    price_number=best["price_number"], seller=best["seller"],
-                   buyable=True)
+                   buyable=True, preorder=best["preorder"])
     else:
         res.update(stock="Out of stock (no offer at target)", price="",
                    price_number=None, seller="", buyable=False)

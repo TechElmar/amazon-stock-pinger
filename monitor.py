@@ -3664,7 +3664,7 @@ class MonitorWorker(QThread):
         if at:
             self.log.emit(
                 f"🛒 OFFER LIST {asin}: at target, {r.get('price')} from "
-                f"{r.get('seller')} (product page says {page})."
+                f"{r.get('seller')}{' (pre-order)' if r.get('preorder') else ''} (product page says {page})."
                 + ("" if live else " Shadow, no ping.")
             )
         else:
