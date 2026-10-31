@@ -541,6 +541,16 @@ SHELL_PAGE_MAX_BYTES = 600 * 1024
 # guard still short-circuits real pages: a truncated page can never
 # be mistaken for a shell. Shells are ~320KB and arrive whole.
 FETCH_MAX_BYTES = 460 * 1024
+
+# WHERE PRODUCT PAGES ARE READ FROM (2026-10-31). /dp/ answered 98% captcha
+# on the IPRoyal lines for every fingerprint. /gp/aw/d/ serves the same
+# desktop page to a desktop fingerprint: 20 of 20 clean across all ten
+# profiles where /dp/ was 0 of 8, then 41 of 51 clean over every watchlist
+# item at 2/s, with the same parser reading stock, price and seller inside
+# FETCH_MAX_BYTES. Ping links stay /dp/ (product_url). The iOS profiles get
+# the mobile layout there, where the seller does not parse, and a ping
+# needs the seller, so they keep reading /dp/.
+PAGE_READ_PATH = "/gp/aw/d/"
 # Raw pages the parser could not classify. See _capture_unknown.
 CAPTURE_DIR = Path("captures")
 
@@ -1204,6 +1214,12 @@ class HTTPAmazonChecker:
     def product_url(self, asin: str) -> str:
         return f"{self.amazon_domain}/dp/{asin}"
 
+    def read_url(self, asin: str, profile: str = "") -> str:
+        """Where a product page read is fetched from. See PAGE_READ_PATH."""
+        if profile.endswith("_ios"):
+            return self.product_url(asin)
+        return f"{self.amazon_domain}{PAGE_READ_PATH}{asin}"
+
     def parse_html(self, asin: str, html: str, proxy_label: str) -> Dict[str, Any]:
         """Parse only the head of the page, which is where every field
         we read actually lives.
@@ -1485,7 +1501,7 @@ class HTTPAmazonChecker:
         async with self.semaphore:
             try:
                 r = await session.get(
-                    url,
+                    self.read_url(asin, getattr(session, "fp_profile", "") or ""),
                     headers=headers,
                     proxy=proxy,
                     timeout=(ROTATING_TIMEOUT_SECONDS if minimal_headers
