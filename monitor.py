@@ -496,13 +496,19 @@ DP_MAX_PER_SECOND = 2.0
 # switch back, no restart either way. Without it the list runs in
 # shadow at AOD_SHADOW_PER_SECOND: read and logged, never announced.
 AOD_PRIMARY_FLAG = Path("aod_primary.on")
-AOD_SHADOW_PER_SECOND = 5.0          # starting rate after a restart
+AOD_SHADOW_PER_SECOND = 8.0          # starting rate after a restart
 # SELF-TUNING (2026-10-05). Every ping now comes from the offer list, so
 # its rate is the ping speed. Each clean minute (< STEPUP % failed) adds
 # 1/s up to MAX; a bad minute (> BACKOFF % failed) halves it, never below
 # MIN, so a flag costs a minute instead of an hour. See _tune_aod_rate.
 AOD_MAX_PER_SECOND = 10.0
-AOD_MIN_PER_SECOND = 3.0
+# ALL-HOT TRIAL (owner, 2026-10-31): every watchlist item is hot, 51 items
+# on the offer list instead of 21. Since the 3 Canadian lines went 407
+# (2026-10-28 22:22, plan ended) Amazon answers ~65% of reads on IPRoyal
+# with a 314-byte 503 that follows the request, not the line, so the
+# old 3/s floor gave ~1 good read/s: one read per item every ~50s at 51
+# items. The floor holds 8/s (0.67/s per line, under OFFER_PER_PROXY_MAX).
+AOD_MIN_PER_SECOND = 8.0
 AOD_STEPUP_FAIL_PCT = 10
 AOD_BACKOFF_FAIL_PCT = 30
 # Per-line health for the offer list (2026-10-26). See _note_offer_proxy.
