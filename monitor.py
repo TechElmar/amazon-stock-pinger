@@ -521,6 +521,26 @@ OFFER_PER_PROXY_MAX = 0.8        # offer-list reads/s per live line, at most
 # read: delete it to go back to logging only, no restart.
 AOD_LIVE_FLAG = Path("aod_live.on")
 
+# OFFER-LIST COOKIES (2026-10-31). Amazon answers most cookieless offer-list
+# reads with its 314-byte 503 (~72% of reads that evening). Each line now
+# keeps the cookies Amazon gave it (session-id, ubid-acbca, i18n-prefs,
+# ak_bmsc...) and one fingerprint, like one visitor per IP. Interleaved
+# probes on the same 12 lines (scratchpad probe_aodkeep.py and
+# probe_jarrate.py), share of reads that were a real list:
+#   fresh session, no cookies (before)     16-21%
+#   kept connection, no cookies            13-20%
+#   cookies, jar reused every 40s          35%
+#   cookies, jar reused every 10s          71%
+#   cookies, jar reused every 2.5s         95%  (a jar's first read fails)
+# Fetch-style Sec-Fetch/XHR headers made it worse (22%). One jar per line
+# at 8/s is a reuse every 1.5s; live, the list went from ~75% failed to 0%
+# within a minute. A jar is dropped after OFFER_JAR_RESET_FAILS failed
+# reads in a row or OFFER_JAR_MAX_AGE seconds. touch aod_cookies.off to go
+# back to cookieless reads, no restart.
+AOD_COOKIES_OFF_FLAG = Path("aod_cookies.off")
+OFFER_JAR_RESET_FAILS = 8
+OFFER_JAR_MAX_AGE = 30 * 60
+
 # A page that is a real product page skeleton with the product data
 # stripped out: correct <title>, but no title element, no availability,
 # no price anywhere. Amazon serves these to IP ranges it distrusts. It
@@ -2165,6 +2185,8 @@ class MonitorWorker(QThread):
         # Offer-list line health. See _note_offer_proxy.
         self._offer_hist: Dict[str, List[int]] = {}
         self._offer_bench: Dict[str, float] = {}
+        self._offer_jars: Dict[str, Dict[str, Any]] = {}
+        self._jar_resets = 0
 
         # Last product image per ASIN, persisted. See IMAGE_CACHE_FILE.
         self._image_cache: Dict[str, str] = {}
@@ -2847,7 +2869,8 @@ class MonitorWorker(QThread):
         return proxy_label_from_url(proxy) in self._rotating_labels
 
     @asynccontextmanager
-    async def _session_for(self, proxy: Optional[str]):
+    async def _session_for(self, proxy: Optional[str],
+                           profile: Optional[str] = None):
         """Yield the HTTP session this proxy needs.
 
         THE WHOLE POINT: a rotating gateway hands out a new exit IP per
@@ -2871,7 +2894,7 @@ class MonitorWorker(QThread):
             async with self._rotating_sem:
                 self._rot_inflight += 1
                 self._rot_peak = max(self._rot_peak, self._rot_inflight)
-                prof = self._pick_profile()
+                prof = profile or self._pick_profile()
                 session = AsyncSession(
                     impersonate=prof,
                     max_clients=1,
@@ -3616,7 +3639,41 @@ class MonitorWorker(QThread):
         proxy = self._next_offer_proxy() or (self.rotating_proxies or [None])[0]
         res = await self._read_aod_via(asin, target, limiter, proxy)
         self._note_offer_proxy(proxy, res)
+        self._note_offer_jar(proxy, res)
         return res
+
+    def _offer_jar(self, proxy: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The cookies and fingerprint an offer-list line reads with, or None
+        when cookies are off or this is not an offer-list line. See
+        AOD_COOKIES_OFF_FLAG."""
+        if not proxy or proxy not in (self._offer_pool or []):
+            return None
+        try:
+            if AOD_COOKIES_OFF_FLAG.exists():
+                return None
+        except OSError:
+            pass
+        now = time.monotonic()
+        jar = self._offer_jars.get(proxy)
+        if jar is None or now - jar["born"] > OFFER_JAR_MAX_AGE:
+            jar = {"fp": self._pick_profile(), "cookies": {}, "born": now,
+                   "fails": 0}
+            self._offer_jars[proxy] = jar
+        return jar
+
+    def _note_offer_jar(self, proxy: Optional[str], res: Dict[str, Any]) -> None:
+        """Start a line on fresh cookies after OFFER_JAR_RESET_FAILS failed
+        reads in a row."""
+        jar = self._offer_jars.get(proxy) if proxy else None
+        if jar is None:
+            return
+        if not self._is_error_result(res):
+            jar["fails"] = 0
+            return
+        jar["fails"] += 1
+        if jar["fails"] >= OFFER_JAR_RESET_FAILS:
+            self._offer_jars.pop(proxy, None)
+            self._jar_resets += 1
 
     async def _read_aod_via(self, asin: str, target: float, limiter,
                             proxy: Optional[str]) -> Dict[str, Any]:
@@ -3628,8 +3685,9 @@ class MonitorWorker(QThread):
         if limiter is not None:
             await limiter.acquire()
         prof = None
+        jar = self._offer_jar(proxy)
         try:
-            async with self._session_for(proxy) as session:
+            async with self._session_for(proxy, jar["fp"] if jar else None) as session:
                 prof = getattr(session, "fp_profile", None)
                 r = await session.get(
                     aodparse.URL.format(asin=asin),
@@ -3637,11 +3695,15 @@ class MonitorWorker(QThread):
                         "Accept-Language": "en-CA,en;q=0.9,en-US;q=0.8",
                         "Referer": f"https://www.amazon.ca/dp/{asin}",
                     },
+                    cookies=(jar["cookies"] or None) if jar else None,
                     proxy=proxy,
                     timeout=ROTATING_TIMEOUT_SECONDS,
                 )
                 status = r.status_code
                 html = r.text
+                if jar is not None:
+                    jar["cookies"].update(
+                        {c.name: c.value for c in session.cookies.jar})
         except Exception:
             return checker.empty_result(asin, "Network error", label)
         if status >= 400:
@@ -3751,9 +3813,12 @@ class MonitorWorker(QThread):
                     self.log.emit(
                         f"🛒 Offer list ({'LIVE' if self._aod_live() else 'shadow'}): "
                         f"{n} reads in the last minute at {limiter.rate:.0f}/s, "
-                        f"{fail_pct}% failed."
+                        f"{fail_pct}% failed"
+                        + (", cookies off." if AOD_COOKIES_OFF_FLAG.exists()
+                           else f", cookies on ({self._jar_resets} jars renewed).")
                     )
                     self._aod_stats = {"ok": 0, "failed": 0}
+                    self._jar_resets = 0
                     report_at = time.monotonic() + 60
                     self._tune_aod_rate(limiter, n, fail_pct)
             if not spawned:
