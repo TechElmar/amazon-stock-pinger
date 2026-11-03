@@ -3856,6 +3856,11 @@ class MonitorWorker(QThread):
         any await is the atomic claim that stops concurrent /dp/ +
         wishlist scans from double-firing."""
         asin = product["asin"]
+        # A paused item never pings, even from a scan task spawned before
+        # it was paused (those used to keep pinging until a restart).
+        enabled = self._enabled_products()
+        if enabled and asin not in enabled:
+            return False
         try:
             target = float(product.get("target_price") or 0)
         except (TypeError, ValueError):
@@ -3986,6 +3991,13 @@ class MonitorWorker(QThread):
         err_streak = 0
 
         while self.running:
+            # A paused item (/untrack, enabled=0) keeps its task but stops
+            # reading until it is enabled again. An empty list means the DB
+            # read failed, not that everything is paused.
+            enabled = self._enabled_products()
+            if enabled and asin not in enabled:
+                await asyncio.sleep(5)
+                continue
             # Reset each pass so a read that raises before assigning
             # cannot be judged by the previous pass's result.
             result = None
