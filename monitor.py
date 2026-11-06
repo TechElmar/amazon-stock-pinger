@@ -785,6 +785,9 @@ MIN_RESTOCK_OOS_SECONDS = 60
 # cheap insurance premium on a channel that size.
 ABSOLUTE_MIN_REPING_SECONDS = 2 * 60
 TARGET_REARM_MARGIN = 0.05                 # price must exceed target by 5%
+# ...and stay there this long, with no at-target read in between. See
+# RE-ARM #2 in _should_alert.
+TARGET_REARM_HOLD_SECONDS = 10 * 60
 
 # ZERO. A per-item clock cannot tell news from noise, and this one was
 # blocking real events: an item re-armed by a genuine price move was
@@ -2146,6 +2149,9 @@ class MonitorWorker(QThread):
         # by Amazon). Only the former makes a comeback a restock.
         self._oos_cause: Dict[str, str] = {}
         self._oos_was_real: Dict[str, bool] = {}
+        # When an item that already pinged was first read above its target
+        # zone with no at-target read since. See TARGET_REARM_HOLD_SECONDS.
+        self._above_zone_since: Dict[str, float] = {}
         self._floor_logged: set = set()
         # (asin, seller_class) pairs already reported as gate-held, so a
         # held item says so once per state rather than every scan.
@@ -3460,10 +3466,25 @@ class MonitorWorker(QThread):
         # RE-ARM #2: price rose clearly above the target zone. The 5%
         # margin means wobble right at the target line can't re-arm —
         # only a real move out of deal territory does.
+        #
+        # HELD, NOT ONE READ (2026-11-06). The price has to stay above the
+        # zone for TARGET_REARM_HOLD_SECONDS with no at-target read in
+        # between. B0HK1CDWR5 pinged 7 times in 12 minutes: the offer list
+        # read Amazon.ca at $7.49 (target $8) every few seconds while the
+        # product page read $10.07, and every $10.07 read re-armed the latch
+        # for the next offer-list read to fire, held back only by the 2 min
+        # floor. A real price move still re-arms, ten minutes later.
+        if price_number <= target * (1 + TARGET_REARM_MARGIN):
+            self._above_zone_since.pop(asin, None)
+        elif self.alert_state.get(asin) == "fired":
+            self._above_zone_since.setdefault(asin, time.monotonic())
         if (
             self.alert_state.get(asin) == "fired"
             and price_number > target * (1 + TARGET_REARM_MARGIN)
+            and time.monotonic() - self._above_zone_since.get(asin, time.monotonic())
+            >= TARGET_REARM_HOLD_SECONDS
         ):
+            self._above_zone_since.pop(asin, None)
             self._set_alert_state(asin, "armed")
             self.log.emit(
                 f"🔄 {asin} re-armed — price ${price_number:.2f} left the "
@@ -3861,8 +3882,11 @@ class MonitorWorker(QThread):
         enabled = self._enabled_products()
         if enabled and asin not in enabled:
             return False
+        # Target from the fresh row, so a /settarget or watchlist.txt change
+        # reaches scan tasks spawned before it (they held the startup row).
         try:
-            target = float(product.get("target_price") or 0)
+            target = float(((enabled or {}).get(asin) or product)
+                           .get("target_price") or 0)
         except (TypeError, ValueError):
             target = 0.0
 
