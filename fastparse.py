@@ -148,6 +148,16 @@ def _after_tag(html: str, anchor: str, size: int,
 
 def _price(html: str) -> str:
     """First price from the same containers the DOM reads, in DOM order."""
+    # Amazon's own price-to-pay label first. On a discounted page the big
+    # price's a-offscreen span is empty, so the first a-offscreen in the
+    # window was the struck-through "Was:" price: B0HK1CDWR5 read $10.07
+    # while it sold at $7.49 (2026-11-06). Of 42 saved pages, 13 carry the
+    # label and that was the only one it changed.
+    text = _after_tag(html, 'id="apex-pricetopay-accessibility-label"', 300)
+    if text:
+        m = _RE_DOLLARS.search(text.split("<", 1)[0])
+        if m:
+            return m.group(1)
     for anchor in _PRICE_ANCHORS:
         win = _window(html, anchor, _PRICE_WINDOW)
         if win is None:
